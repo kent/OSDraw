@@ -11,116 +11,24 @@ import {Ticket} from "../src/model/Ticket.sol";
 import "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 
 /**
- * @title OSDrawInvariantTest
- * @dev Invariant testing for OSDraw system
- * 
- * This test suite verifies that critical security properties always hold 
- * through state transitions and under a wide range of operations.
+ * @title OSDrawHandler
+ * @dev Handler contract for fuzzing the OSDraw system
  */
-contract OSDrawInvariantTest is Test {
+contract OSDrawHandler is Test {
     OSDraw public osDraw;
-    address public admin;
-    address public manager;
-    address public openSourceRecipient;
-    
-    // Actors in the system
     address[] public actors;
-    
-    // Mock VRF system for randomness testing
-    MockVRFSystem public mockVRF;
+    address public mockVRF;
     
     // State tracking for invariants
     uint256 public totalEthDeposited;
     uint256 public totalEthWithdrawn;
     
-    function setUp() public {
-        // Setup addresses
-        admin = makeAddr("admin");
-        manager = makeAddr("manager");
-        openSourceRecipient = makeAddr("openSourceRecipient");
-        
-        // Create actor addresses for invariant testing
-        for (uint256 i = 0; i < 10; i++) {
-            actors.push(makeAddr(string(abi.encodePacked("actor", vm.toString(i)))));
-            vm.deal(actors[i], 100 ether);
-        }
-        
-        // Deploy mock VRF for randomness testing
-        mockVRF = new MockVRFSystem();
-        
-        // Deploy implementation
-        OSDraw implementation = new OSDraw();
-        
-        // Deploy proxy pointing to implementation
-        ERC1967Proxy proxy = new ERC1967Proxy(
-            address(implementation),
-            abi.encodeWithSelector(
-                OSDraw.initialize.selector,
-                openSourceRecipient,
-                admin,
-                manager,
-                40 // Admin share of 40%
-            )
-        );
-        
-        // Cast proxy to OSDraw interface
-        osDraw = OSDraw(address(proxy));
-        
-        // Configure VRF entropy source
-        vm.prank(admin);
-        osDraw.setEntropySource(address(mockVRF));
-        
-        // Target contract functions for invariant testing
-        targetContract(address(this));
-        
-        // Reset trackers
+    constructor(OSDraw _osDraw, address[] memory _actors, address _mockVRF) {
+        osDraw = _osDraw;
+        actors = _actors;
+        mockVRF = _mockVRF;
         totalEthDeposited = 0;
         totalEthWithdrawn = 0;
-    }
-    
-    /**
-     * @dev Invariant: No ETH can be lost in the system
-     * The contract balance should always equal:
-     * (Total ETH deposited - Total ETH withdrawn)
-     */
-    function invariant_noLostEth() public {
-        assertEq(
-            address(osDraw).balance,
-            totalEthDeposited - totalEthWithdrawn,
-            "ETH accounting error: funds lost"
-        );
-    }
-    
-    /**
-     * @dev Invariant: The sum of all daily pots and pool balances equals the contract balance
-     */
-    function invariant_balanceMatchesPots() public {
-        uint256 totalInDailyPots = 0;
-        uint256 totalInPools = 0;
-        
-        // Sum all daily pots (up to a reasonable limit)
-        for (uint256 day = 0; day < 100; day++) {
-            totalInDailyPots += osDraw.dailyPot(day);
-        }
-        
-        // Sum all pool balances
-        for (uint256 poolId = Constants.POOL_ID_THRESHOLD; poolId <= Constants.POOL_ID_THRESHOLD + 100; poolId++) {
-            Pool memory pool = osDraw.getPool(poolId);
-            totalInPools += pool.ethBalance;
-        }
-        
-        // The total of all pots should equal the contract balance plus pending payments
-        // This is approximate as we don't have access to all pending payments in this test
-        uint256 contractBalance = address(osDraw).balance;
-        
-        // Only check this invariant if no funds have been withdrawn (simplified test)
-        if (totalEthWithdrawn == 0) {
-            assertEq(
-                contractBalance,
-                totalInDailyPots + totalInPools,
-                "Balance doesn't match sum of pots and pools"
-            );
-        }
     }
     
     /**
@@ -168,7 +76,7 @@ contract OSDrawInvariantTest is Test {
         ticketPrice = bound(ticketPrice, 0.001 ether, 1 ether);
         
         // Create pool
-        vm.startPrank(admin);
+        vm.startPrank(osDraw.admin());
         Pool memory poolParams = Pool({
             ticketPrice: ticketPrice,
             totalSold: 0,
@@ -221,8 +129,11 @@ contract OSDrawInvariantTest is Test {
         // Attempt to execute draw
         try osDraw.performDailyDraw() {
             // Try to callback with random number
-            vm.prank(address(mockVRF));
-            osDraw.randomNumberCallback(mockVRF.requestCount(), uint256(keccak256(abi.encode(block.timestamp))));
+            vm.prank(mockVRF);
+            osDraw.randomNumberCallback(
+                MockVRFSystem(mockVRF).requestCount(), 
+                uint256(keccak256(abi.encode(block.timestamp)))
+            );
         } catch {
             // Ignore failures (e.g., if conditions for draw not met)
         }
@@ -238,8 +149,11 @@ contract OSDrawInvariantTest is Test {
         // Attempt to execute draw
         try osDraw.performPoolDraw(poolId) {
             // Try to callback with random number
-            vm.prank(address(mockVRF));
-            osDraw.randomNumberCallback(mockVRF.requestCount(), uint256(keccak256(abi.encode(block.timestamp, poolId))));
+            vm.prank(mockVRF);
+            osDraw.randomNumberCallback(
+                MockVRFSystem(mockVRF).requestCount(), 
+                uint256(keccak256(abi.encode(block.timestamp, poolId)))
+            );
         } catch {
             // Ignore failures
         }
@@ -269,34 +183,156 @@ contract OSDrawInvariantTest is Test {
      * @dev Update manager for randomness
      */
     function updateManager(uint256 actorIdx) public {
+        address currentManager = osDraw.manager();
         // Only allow current manager to call
-        vm.prank(manager);
+        vm.prank(currentManager);
         
         // Pick a new manager
         address newManager = actors[actorIdx % actors.length];
         
         // Update
         osDraw.transferManager(newManager);
-        
-        // Update state
-        manager = newManager;
     }
     
     /**
      * @dev Update open source recipient for randomness
      */
     function updateOpenSourceRecipient(uint256 actorIdx) public {
+        address currentManager = osDraw.manager();
         // Only allow current manager to call
-        vm.prank(manager);
+        vm.prank(currentManager);
         
         // Pick a new recipient
         address newRecipient = actors[actorIdx % actors.length];
         
         // Update
         osDraw.updateOpenSourceRecipient(newRecipient);
+    }
+}
+
+/**
+ * @title OSDrawInvariantTest
+ * @dev Invariant testing for OSDraw system
+ * 
+ * This test suite verifies that critical security properties always hold 
+ * through state transitions and under a wide range of operations.
+ */
+contract OSDrawInvariantTest is Test {
+    OSDraw public osDraw;
+    address public admin;
+    address public manager;
+    address public openSourceRecipient;
+    
+    // Actors in the system
+    address[] public actors;
+    
+    // Mock VRF system for randomness testing
+    MockVRFSystem public mockVRF;
+    
+    // Handler for invariant testing
+    OSDrawHandler public handler;
+    
+    function setUp() public {
+        // Setup addresses
+        admin = makeAddr("admin");
+        manager = makeAddr("manager");
+        openSourceRecipient = makeAddr("openSourceRecipient");
         
-        // Update state
-        openSourceRecipient = newRecipient;
+        // Create actor addresses for invariant testing
+        for (uint256 i = 0; i < 10; i++) {
+            actors.push(makeAddr(string(abi.encodePacked("actor", vm.toString(i)))));
+            vm.deal(actors[i], 100 ether);
+        }
+        
+        // Deploy mock VRF for randomness testing
+        mockVRF = new MockVRFSystem();
+        
+        // Deploy implementation
+        OSDraw implementation = new OSDraw();
+        
+        // Deploy proxy pointing to implementation
+        ERC1967Proxy proxy = new ERC1967Proxy(
+            address(implementation),
+            abi.encodeWithSelector(
+                OSDraw.initialize.selector,
+                openSourceRecipient,
+                admin,
+                manager,
+                40 // Admin share of 40%
+            )
+        );
+        
+        // Cast proxy to OSDraw interface
+        osDraw = OSDraw(address(proxy));
+        
+        // Configure VRF entropy source
+        vm.prank(admin);
+        osDraw.setEntropySource(address(mockVRF));
+        
+        // Deploy handler for invariant testing
+        handler = new OSDrawHandler(osDraw, actors, address(mockVRF));
+        
+        // Set up the fuzzing environment
+        targetContract(address(handler));
+        
+        // Configure methods to be called during invariant fuzzing
+        bytes4[] memory selectors = new bytes4[](6);
+        selectors[0] = handler.buyDailyTickets.selector;
+        selectors[1] = handler.createPool.selector;
+        selectors[2] = handler.buyPoolTickets.selector;
+        selectors[3] = handler.performDailyDraw.selector;
+        selectors[4] = handler.performPoolDraw.selector; 
+        selectors[5] = handler.withdrawPendingPayments.selector;
+        
+        targetSelector(FuzzSelector({
+            addr: address(handler),
+            selectors: selectors
+        }));
+    }
+    
+    /**
+     * @dev Invariant: No ETH can be lost in the system
+     * The contract balance should always equal:
+     * (Total ETH deposited - Total ETH withdrawn)
+     */
+    function invariant_noLostEth() public {
+        assertEq(
+            address(osDraw).balance,
+            handler.totalEthDeposited() - handler.totalEthWithdrawn(),
+            "ETH accounting error: funds lost"
+        );
+    }
+    
+    /**
+     * @dev Invariant: The sum of all daily pots and pool balances equals the contract balance
+     */
+    function invariant_balanceMatchesPots() public {
+        uint256 totalInDailyPots = 0;
+        uint256 totalInPools = 0;
+        
+        // Sum all daily pots (up to a reasonable limit)
+        for (uint256 day = 0; day < 100; day++) {
+            totalInDailyPots += osDraw.dailyPot(day);
+        }
+        
+        // Sum all pool balances
+        for (uint256 poolId = Constants.POOL_ID_THRESHOLD; poolId <= Constants.POOL_ID_THRESHOLD + 100; poolId++) {
+            Pool memory pool = osDraw.getPool(poolId);
+            totalInPools += pool.ethBalance;
+        }
+        
+        // The total of all pots should equal the contract balance plus pending payments
+        // This is approximate as we don't have access to all pending payments in this test
+        uint256 contractBalance = address(osDraw).balance;
+        
+        // Only check this invariant if no funds have been withdrawn (simplified test)
+        if (handler.totalEthWithdrawn() == 0) {
+            assertEq(
+                contractBalance,
+                totalInDailyPots + totalInPools,
+                "Balance doesn't match sum of pots and pools"
+            );
+        }
     }
 }
 
