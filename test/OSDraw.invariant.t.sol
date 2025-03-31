@@ -442,6 +442,191 @@ contract OSDrawInvariantTest is Test {
             }
         }
     }
+
+    /**
+     * @dev Invariant: Daily draw cooldown period is respected
+     * - No tickets can be bought in the last hour of the day
+     * - Draws can only happen after cooldown
+     */
+    function invariant_dailyDrawCooldown() public {
+        uint256 currentDay = block.timestamp / 1 days;
+        uint256 currentHour = (block.timestamp % 1 days) / 1 hours;
+        
+        // If we're in the last hour of the day
+        if (currentHour >= 23) {
+            // Try to buy tickets - should fail
+            for (uint256 i = 0; i < actors.length; i++) {
+                vm.prank(actors[i]);
+                try osDraw.buyTickets{value: 0.1 ether}(1) {
+                    require(false, "Should not be able to buy tickets in cooldown period");
+                } catch {
+                    // Expected to fail
+                }
+            }
+        }
+    }
+
+    /**
+     * @dev Invariant: Pool state transitions are valid
+     * - Active pools can only be deactivated by admin
+     * - Inactive pools can only be activated by admin
+     * - Pool balances are preserved during state changes
+     */
+    function invariant_poolStateTransitions() public {
+        for (uint256 poolId = Constants.POOL_ID_THRESHOLD; poolId <= Constants.POOL_ID_THRESHOLD + 100; poolId++) {
+            Pool memory pool = osDraw.getPool(poolId);
+            if (pool.ticketPrice > 0) {
+                uint256 initialBalance = pool.ethBalance;
+                
+                // Try to change state from non-admin
+                for (uint256 i = 0; i < actors.length; i++) {
+                    vm.prank(actors[i]);
+                    try osDraw.setPoolActive(poolId, !pool.active) {
+                        require(false, "Non-admin should not be able to change pool state");
+                    } catch {
+                        // Expected to fail
+                    }
+                }
+                
+                // Verify balance hasn't changed
+                pool = osDraw.getPool(poolId);
+                assertEq(pool.ethBalance, initialBalance, "Pool balance changed during state transition");
+            }
+        }
+    }
+
+    /**
+     * @dev Invariant: Ticket pricing tiers are correct
+     * - Matches the constants defined in the contract
+     */
+    function invariant_ticketPricing() public {
+        // Check that prices match constants
+        assertEq(
+            osDraw.getPrice(1),
+            Constants.PRICE_ONE,
+            "1 ticket price incorrect"
+        );
+        
+        assertEq(
+            osDraw.getPrice(5),
+            Constants.PRICE_FIVE,
+            "5 ticket price incorrect"
+        );
+        
+        assertEq(
+            osDraw.getPrice(20),
+            Constants.PRICE_TWENTY,
+            "20 ticket price incorrect"
+        );
+        
+        assertEq(
+            osDraw.getPrice(100),
+            Constants.PRICE_HUNDRED,
+            "100 ticket price incorrect"
+        );
+    }
+
+    /**
+     * @dev Invariant: VRF integration works correctly
+     * - Random numbers are requested for each draw
+     * - Callbacks are only accepted from VRF provider
+     */
+    function invariant_vrfIntegration() public {
+        // Use a directed test approach instead of the invariant approach
+        // since VRF interaction is stateful and needs specific conditions
+        
+        // Create mock VRF with direct integration
+        MockVRFSystem directMockVRF = new MockVRFSystem();
+        
+        // Set it as entropy source
+        vm.startPrank(osDraw.admin());
+        osDraw.setEntropySource(address(directMockVRF));
+        vm.stopPrank();
+        
+        // Create buyer with funds
+        address buyer = makeAddr("vrfTestBuyer");
+        vm.deal(buyer, 1 ether);
+        
+        // Buy tickets for yesterday
+        vm.warp((block.timestamp / 1 days) * 1 days);  // Start of day
+        vm.prank(buyer);
+        osDraw.buyTickets{value: osDraw.getPrice(1)}(1);
+        
+        // Move to next day
+        vm.warp(((block.timestamp / 1 days) + 1) * 1 days + 1 hours);  // Start of next day + 1 hour
+        
+        // Get initial request count
+        uint256 initialRequestCount = directMockVRF.requestCount();
+        
+        // Perform daily draw
+        osDraw.performDailyDraw();
+        
+        // Verify VRF was called
+        assertEq(
+            directMockVRF.requestCount(),
+            initialRequestCount + 1,
+            "VRF not called for daily draw"
+        );
+        
+        // Try to callback from non-VRF address
+        vm.prank(actors[0]);
+        try osDraw.randomNumberCallback(directMockVRF.requestCount(), 123) {
+            require(false, "Non-VRF should not be able to callback");
+        } catch {
+            // Expected to fail
+        }
+        
+        // Callback from VRF address should succeed
+        uint256 requestId = directMockVRF.requestCount();
+        vm.prank(address(directMockVRF));
+        osDraw.randomNumberCallback(requestId, 999);
+        
+        // Ensure winner has a pending payment
+        bool someonePending = false;
+        for (uint256 i = 0; i < actors.length; i++) {
+            if (osDraw.getPendingPayment(actors[i]) > 0) {
+                someonePending = true;
+                break;
+            }
+        }
+        
+        if (osDraw.getPendingPayment(buyer) > 0) {
+            someonePending = true;
+        }
+        
+        // Either the buyer or someone in actors should have a pending payment
+        // since one of them must be the winner
+        assertTrue(
+            someonePending || 
+            osDraw.getPendingPayment(osDraw.admin()) > 0 || 
+            osDraw.getPendingPayment(osDraw.openSourceRecipient()) > 0,
+            "No pending payments after draw"
+        );
+    }
+
+    /**
+     * @dev Invariant: Emergency withdrawal safety
+     * - Only owner can initiate emergency withdrawal
+     */
+    function invariant_emergencyWithdrawal() public {
+        // Add some funds to withdraw
+        vm.deal(address(osDraw), 10 ether);
+        
+        address recipient = makeAddr("emergencyRecipient");
+        uint256 withdrawAmount = 1 ether;
+        
+        // Try emergency withdrawal from non-owner
+        for (uint256 i = 0; i < actors.length; i++) {
+            if (actors[i] != osDraw.owner()) {
+                vm.prank(actors[i]);
+                try osDraw.emergencyWithdraw(withdrawAmount, recipient) {
+                    require(false, "Non-owner should not be able to initiate emergency withdrawal");
+                } catch {
+                    // Expected to fail
+                }
+            }
+        }
+    }
 }
 
 /**
