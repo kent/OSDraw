@@ -112,14 +112,15 @@ contract DeployOSDraw is Script {
         // -------------------------------------------------------------------------
         // Step 7: Set up VRF integration (if available)
         // -------------------------------------------------------------------------
-        // If you have a VRF provider address, you could set it here
-        // Example (commented out since we don't have a real VRF yet):
-        // address vrfProvider = vm.envAddress("VRF_PROVIDER_ADDRESS");
-        // if (vrfProvider != address(0)) {
-        //     console.log("Setting up VRF integration...");
-        //     osdraw.setEntropySource(vrfProvider);
-        //     console.log("VRF provider set to:", vrfProvider);
-        // }
+        // If you have a VRF provider address, set it up
+        address vrfProvider = vm.envOr("VRF_PROVIDER_ADDRESS", address(0));
+        if (vrfProvider != address(0)) {
+            console.log("Setting up VRF integration...");
+            osdraw.setEntropySource(vrfProvider);
+            console.log("VRF provider set to:", vrfProvider);
+        } else {
+            console.log("No VRF provider specified. Random draws will not work until a provider is set.");
+        }
         
         // End the broadcast - this is important to signal the end of the transaction group
         vm.stopBroadcast();
@@ -136,6 +137,7 @@ contract DeployOSDraw is Script {
         console.log("Admin Share:    ", adminShare, "%");
         console.log("Initial Pool ID: 1");
         console.log("Version:        ", osdraw.getVersion());
+        console.log("VRF Provider:   ", vrfProvider == address(0) ? "Not configured" : vm.toString(vrfProvider));
         console.log("================================\n");
         
         console.log("Deployment completed successfully!");
@@ -183,7 +185,20 @@ contract UpgradeOSDraw is Script {
         // Note: This requires that the deployer is the owner of the proxy
         // OSDraw uses the UUPS upgrade pattern, so upgrades are done via the proxy itself
         console.log("Upgrading proxy to new implementation...");
-        osdraw.upgradeToAndCall(address(newImplementation), "");
+        
+        // The first upgrade attempt will be queued due to timelock
+        try osdraw.upgradeToAndCall(address(newImplementation), "") {
+            console.log("Upgrade succeeded without timelock - unexpected behavior");
+        } catch Error(string memory reason) {
+            console.log("Upgrade queued as expected: ", reason);
+            console.log("You'll need to run this script again after the timelock period expires");
+            
+            // Stop broadcast since we need to wait for timelock
+            vm.stopBroadcast();
+            return;
+        }
+        
+        // If the upgrade proceeded without timelock, verify it
         console.log("Proxy upgraded to:", address(newImplementation));
         
         // -------------------------------------------------------------------------
@@ -222,6 +237,7 @@ contract UpgradeOSDraw is Script {
  *    OPENSOURCE_RECIPIENT=0x...
  *    ADMIN_ADDRESS=0x...
  *    MANAGER_ADDRESS=0x...
+ *    VRF_PROVIDER_ADDRESS=0x... (optional)
  *    ```
  * 
  * Deployment Steps:
@@ -251,5 +267,7 @@ contract UpgradeOSDraw is Script {
  * source .env
  * forge script script/DeployOSDraw.s.sol:UpgradeOSDraw --rpc-url <RPC_URL> --broadcast --verify
  * ```
+ * Note that upgrades are subject to a timelock period (default 2 days). You'll need to run the
+ * script twice: once to queue the upgrade, and again after the timelock period to execute it.
  *
- */ 
+ */
