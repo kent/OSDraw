@@ -28,4 +28,9 @@ error PoolNotFound();
 error PoolNotActive();
 
 // System errors
-error TransferFailed(); 
+error TransferFailed();
+
+// Timelock errors
+error OperationNotQueued();
+error OperationNotReady();
+error VRFNotConfigured(); 

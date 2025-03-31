@@ -5,13 +5,32 @@ import "../OSDrawStorage.sol";
 import "../interfaces/IVRF.sol";
 import "../errors/OSDraw.sol";
 import "../events/OSDraw.sol";
+import "../model/Constants.sol";
 
 /**
  * @title OSDrawVRF
  * @dev Handles random number generation and callbacks for OSDraw
  */
 contract OSDrawVRF is OSDrawStorage, IVRFSystemCallback {
-    uint256 constant VRF_TRACE_ID = uint256(keccak256("app.osdraw.draw.v1"));
+    // Constants from Constants library
+    uint256 constant VRF_TRACE_ID = Constants.VRF_TRACE_ID;
+    uint256 private constant PERCENT_DIVISOR = Constants.PERCENT_DIVISOR;
+    uint256 private constant PROJECT_SHARE = Constants.PROJECT_SHARE;
+    uint256 private constant POOL_ID_THRESHOLD = Constants.POOL_ID_THRESHOLD;
+    
+    // Add a new mapping for pending payments
+    mapping(address => uint256) private _pendingPayments;
+    
+    /**
+     * Prevents a contract from calling itself, directly or indirectly.
+     */
+    modifier nonReentrant() virtual {
+        Storage storage s = _getStorage();
+        require(s.reentrancyStatus != ENTERED, "ReentrancyGuard: reentrant call");
+        s.reentrancyStatus = ENTERED;
+        _;
+        s.reentrancyStatus = NOT_ENTERED;
+    }
     
     /**
      * Set the entropy source address for VRF integration
@@ -53,7 +72,7 @@ contract OSDrawVRF is OSDrawStorage, IVRFSystemCallback {
      * @param requestId The ID of the request
      * @param randomNumber The generated random number
      */
-    function randomNumberCallback(uint256 requestId, uint256 randomNumber) external override {
+    function randomNumberCallback(uint256 requestId, uint256 randomNumber) external override nonReentrant {
         Storage storage s = _getStorage();
         
         // Validate caller is the entropy source
@@ -63,33 +82,19 @@ contract OSDrawVRF is OSDrawStorage, IVRFSystemCallback {
         
         // Retrieve callback data
         address receiver = s.callbackReceiver[seqNo];
-        uint256 poolId = s.callbackPool[seqNo];
+        if (receiver == address(0)) revert("Invalid request ID");
         
-        // Validate callback data exists
-        if (receiver == address(0)) return; // Missing data, ignore callback
+        uint256 poolId = s.callbackPool[seqNo];
         
         // Clean up callback data
         s.callbackReceiver[seqNo] = address(0);
         s.callbackPool[seqNo] = 0;
         
-        // Process the draw with the random number
-        _processDraw(poolId, receiver, randomNumber);
-    }
-    
-    /**
-     * Process the draw with the provided randomness
-     * @param poolId The ID of the pool
-     * @param receiver The receiver address
-     * @param randomNumber The random number for the draw
-     */
-    function _processDraw(uint256 poolId, address receiver, uint256 randomNumber) internal {
-        Storage storage s = _getStorage();
-        
-        // Check if this is a day-based draw (legacy system) or a pool-based draw
-        if (poolId < 10000) { // Assuming poolIds will never be this small, safer to use a flag
+        // Process the draw based on pool ID
+        if (poolId < POOL_ID_THRESHOLD) {
             _processDayDraw(poolId, randomNumber);
         } else {
-            _processPoolDraw(poolId, randomNumber);
+            _processPoolDraw(poolId, receiver, randomNumber);
         }
     }
     
@@ -106,6 +111,7 @@ contract OSDrawVRF is OSDrawStorage, IVRFSystemCallback {
         uint256 participantCount = participants.length;
         if (participantCount == 0) return;
         
+        // Select winner with random number
         uint256 winnerIndex = randomNumber % participantCount;
         address winner = participants[winnerIndex];
         
@@ -115,14 +121,22 @@ contract OSDrawVRF is OSDrawStorage, IVRFSystemCallback {
         
         s.dailyPot[day] = 0;
         
-        uint256 adminAmount = (pot * s.adminShare) / 100;
-        uint256 projectAmount = (pot * 50) / 100; // Project share is 50%
+        uint256 adminAmount = (pot * s.adminShare) / PERCENT_DIVISOR;
+        uint256 projectAmount = (pot * PROJECT_SHARE) / PERCENT_DIVISOR;
         uint256 winnerAmount = pot - adminAmount - projectAmount;
         
-        // Distribute prizes
-        payable(s.openSourceRecipient).transfer(projectAmount);
-        payable(s.admin).transfer(adminAmount);
-        payable(winner).transfer(winnerAmount);
+        // Validate recipients
+        address osRecipient = s.openSourceRecipient;
+        address adminRecipient = s.admin;
+        
+        if (osRecipient == address(0) || adminRecipient == address(0) || winner == address(0)) {
+            revert InvalidAddress();
+        }
+        
+        // Use pull pattern - store pending amounts
+        _addPendingPayment(osRecipient, projectAmount);
+        _addPendingPayment(adminRecipient, adminAmount);
+        _addPendingPayment(winner, winnerAmount);
         
         // Emit event
         emit DailyDrawPerformed(day, winner, winnerAmount);
@@ -133,16 +147,86 @@ contract OSDrawVRF is OSDrawStorage, IVRFSystemCallback {
      * @param poolId The pool ID to draw for
      * @param randomNumber The random number
      */
-    function _processPoolDraw(uint256 poolId, uint256 randomNumber) private {
-        // This will be implemented with full pool draw mechanics
-        // Currently a placeholder
-        revert("Pool draws not yet implemented");
+    function _processPoolDraw(uint256 poolId, address /* receiver */, uint256 randomNumber) private {
+        Storage storage s = _getStorage();
+        
+        // Get pool data
+        Pool storage pool = s.pools[poolId];
+        if (pool.ticketPrice == 0) return; // Pool not found
+        if (pool.ethBalance == 0) return; // No funds to distribute
+        
+        // Get the participants and select a winner based on tickets bought
+        address[] memory participants = s.poolParticipants[poolId];
+        uint256 participantCount = participants.length;
+        
+        // If no participants, just return
+        if (participantCount == 0) return;
+        
+        uint256 winnerIndex = randomNumber % participantCount;
+        address winner = participants[winnerIndex];
+        
+        // Calculate prize distribution
+        uint256 pot = pool.ethBalance;
+        pool.ethBalance = 0;
+        
+        uint256 adminAmount = (pot * s.adminShare) / PERCENT_DIVISOR;
+        uint256 projectAmount = (pot * PROJECT_SHARE) / PERCENT_DIVISOR;
+        uint256 winnerAmount = pot - adminAmount - projectAmount;
+        
+        // Use pull pattern instead of direct transfers
+        _addPendingPayment(s.openSourceRecipient, projectAmount);
+        _addPendingPayment(s.admin, adminAmount);
+        _addPendingPayment(winner, winnerAmount);
+        
+        // Increase redeemed count
+        pool.totalRedeemed++;
+        
+        // Emit event for the winner
+        emit PoolDrawPerformed(poolId, winner, winnerAmount);
+    }
+    
+    /**
+     * Add to the pending payment for an address
+     * @param recipient The recipient
+     * @param amount The amount to add
+     */
+    function _addPendingPayment(address recipient, uint256 amount) private {
+        if (recipient == address(0) || amount == 0) return;
+        _pendingPayments[recipient] += amount;
+    }
+    
+    /**
+     * Get the pending payment for an address
+     * @param recipient The recipient
+     * @return The pending payment amount
+     */
+    function getPendingPayment(address recipient) external view returns (uint256) {
+        return _pendingPayments[recipient];
+    }
+    
+    /**
+     * Withdraw pending payment
+     */
+    function withdrawPendingPayment() external nonReentrant {
+        uint256 amount = _pendingPayments[msg.sender];
+        if (amount == 0) revert InvalidAmount();
+        
+        // Clear pending payment before transfer to prevent reentrancy
+        _pendingPayments[msg.sender] = 0;
+        
+        // Transfer ETH to the recipient using the safer call pattern
+        (bool success, ) = payable(msg.sender).call{value: amount}("");
+        
+        // Revert if transfer fails to ensure consistent state
+        if (!success) revert TransferFailed();
+        
+        emit PaymentWithdrawn(msg.sender, amount);
     }
     
     /**
      * Access control: only admin can call functions with this modifier
      */
-    modifier onlyAdmin() {
+    modifier onlyAdmin() virtual {
         if (msg.sender != _getStorage().admin) revert Unauthorized();
         _;
     }

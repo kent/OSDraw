@@ -1,57 +1,115 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import "./OSDrawConfig.sol";
+import "../OSDrawStorage.sol";
 import "../errors/OSDraw.sol";
 import "../events/OSDraw.sol";
+import "../model/Constants.sol";
 
-contract OSDrawTickets is OSDrawConfig {
+/**
+ * @title OSDrawTickets
+ * @dev Handles ticket purchasing and tracking
+ */
+contract OSDrawTickets is OSDrawStorage {
     /**
-     * Buy preset quantity of entries
-     * @param quantity The number of tickets to purchase
+     * Buy tickets for the current day
+     * @param quantity Number of tickets to buy (must be a valid quantity)
      */
-    function buyTickets(uint256 quantity) external payable {
+    function buyTickets(uint256 quantity) external payable virtual {
         uint256 price = getPrice(quantity);
         if (msg.value != price) revert IncorrectPaymentAmount();
-
-        uint256 day = getCurrentDay();
+        
+        // Calculate current day
+        uint256 today = getCurrentDay();
+        
         Storage storage s = _getStorage();
         
-        for (uint256 i = 0; i < quantity; i++) {
-            s.ticketsByDay[day].push(msg.sender);
+        // Track tickets by day - first purchase adds to array
+        if (s.userTicketCountByDay[today][msg.sender] == 0) {
+            s.ticketsByDay[today].push(msg.sender);
         }
         
-        // Update user ticket count for O(1) lookup
-        s.userTicketCountByDay[day][msg.sender] += quantity;
-
-        s.dailyPot[day] += msg.value;
-        emit TicketsPurchased(msg.sender, day, quantity, msg.value);
+        // Update ticket count
+        s.userTicketCountByDay[today][msg.sender] += quantity;
+        
+        // Add to daily pot
+        s.dailyPot[today] += msg.value;
+        
+        emit TicketsPurchased(msg.sender, today, quantity, msg.value);
     }
     
     /**
-     * Buy tickets for a specific pool
-     * @param poolId The pool ID to buy tickets for
-     * @param quantity The number of tickets to purchase
+     * Get the price for a specific ticket quantity
+     * @param quantity The number of tickets
+     * @return The price in ETH
+     */
+    function getPrice(uint256 quantity) public pure virtual returns (uint256) {
+        if (quantity == 1) return Constants.PRICE_ONE;
+        else if (quantity == 5) return Constants.PRICE_FIVE;
+        else if (quantity == 20) return Constants.PRICE_TWENTY;
+        else if (quantity == 100) return Constants.PRICE_HUNDRED;
+        revert InvalidTicketQuantity();
+    }
+    
+    /**
+     * Buy tickets for a specific prize pool
+     * @param poolId The ID of the pool
+     * @param quantity Number of tickets to buy
      */
     function buyPoolTickets(uint256 poolId, uint256 quantity) external payable {
         Storage storage s = _getStorage();
         
-        // Validate pool exists and is active
+        // Validate pool ID
+        if (poolId == 0 || poolId < Constants.POOL_ID_THRESHOLD) revert PoolNotFound();
+        
+        // Get pool
         Pool storage pool = s.pools[poolId];
+        
+        // Verify pool is valid and active
         if (pool.ticketPrice == 0) revert PoolNotFound();
         if (!pool.active) revert PoolNotActive();
         
-        // Calculate and verify price
-        uint256 price = pool.ticketPrice * quantity;
-        if (msg.value != price) revert IncorrectPaymentAmount();
+        // Strict quantity validation to prevent overflow attacks
+        if (quantity == 0 || quantity > 1000) revert InvalidTicketQuantity();
         
-        // Update pool state
-        pool.totalSold += quantity;
+        // Protect against multiplication overflow in price calculation
+        // For extremely high ticket prices, this would still allow up to 1000 tickets
+        // without risking overflow
+        uint256 expectedPayment;
+        unchecked {
+            // Even with unchecked, we've validated the quantity is <= 1000
+            // so overflow is impossible for any realistic ticket price
+            expectedPayment = pool.ticketPrice * quantity;
+        }
+        
+        // Additional check: if price is too high, operations might overflow
+        if (pool.ticketPrice > 0 && expectedPayment / pool.ticketPrice != quantity) 
+            revert InvalidTicketQuantity();
+        
+        // Verify payment amount exactly matches the expected amount
+        if (msg.value != expectedPayment) revert IncorrectPaymentAmount();
+        
+        // Add to pool balance
         pool.ethBalance += msg.value;
+        pool.totalSold += quantity;
         
-        // Update user tickets
-        s.tickets[poolId][msg.sender].purchased += quantity;
+        // Update user ticket tracking
+        Ticket storage userTicket = s.tickets[poolId][msg.sender];
+        
+        // Track first-time buyers in this pool (similar to daily tickets)
+        if (userTicket.purchased == 0) {
+            s.poolParticipants[poolId].push(msg.sender);
+        }
+        
+        // Protect against overflow
+        if (userTicket.purchased + quantity < userTicket.purchased) revert InvalidTicketQuantity();
+        if (s.config.currentSupply + quantity < s.config.currentSupply) revert InvalidTicketQuantity();
+        
+        userTicket.purchased += quantity;
         s.config.currentSupply += quantity;
+        
+        // Update total pool tickets for random selection
+        s.totalPoolTickets[poolId] += quantity;
         
         emit PoolTicketsPurchased(poolId, msg.sender, quantity, msg.value);
     }

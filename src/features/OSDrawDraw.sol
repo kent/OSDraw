@@ -2,7 +2,7 @@
 pragma solidity ^0.8.20;
 
 import "./OSDrawTickets.sol";
-import "../OSDrawVRF.sol";
+import "./OSDrawVRF.sol";
 import "../errors/OSDraw.sol";
 import "../events/OSDraw.sol";
 
@@ -11,6 +11,9 @@ import "../events/OSDraw.sol";
  * @dev Handles the lottery drawing functionality
  */
 contract OSDrawDraw is OSDrawTickets, OSDrawVRF {
+    // Cooldown period before a draw where new ticket purchases are rejected
+    uint256 private constant DRAW_COOLDOWN = 1 hours;
+    
     /**
      * Trigger draw for previous day
      */
@@ -34,59 +37,49 @@ contract OSDrawDraw is OSDrawTickets, OSDrawVRF {
         // Mark draw as executed
         s.drawExecuted[drawDay] = true;
         
-        // If VRF is configured, use it
-        if (s.entropySource != address(0)) {
-            // Use VRF for true randomness
-            requestRandomDraw(drawDay, msg.sender);
-            // The actual draw will happen in the callback
-        } else {
-            // Fallback to pseudo-random if VRF not configured
-            _performLegacyDraw(drawDay);
-        }
+        // Cache entropy source to avoid multiple SLOADs
+        address entropySource = s.entropySource;
+        
+        // Require VRF to be configured
+        if (entropySource == address(0)) revert VRFNotConfigured();
+            
+        // Use VRF for true randomness
+        requestRandomDraw(drawDay, msg.sender);
+        // The actual draw will happen in the callback
     }
     
-    /**
-     * Legacy draw method using pseudo-random number
-     * @param drawDay The day to perform draw for
-     */
-    function _performLegacyDraw(uint256 drawDay) private {
+    // This modifies the buyTickets function to include anti-frontrunning protection
+    function buyTickets(uint256 quantity) external payable override {
+        // Get current time to check for cooldown period
+        uint256 currentTime = block.timestamp;
+        uint256 today = currentTime / 1 days;
+        uint256 secondsIntoDay = currentTime % 1 days;
+        
+        // If close to end of day (within the cooldown period),
+        // prevent new ticket purchases to avoid front-running
+        if (secondsIntoDay > 1 days - DRAW_COOLDOWN) {
+            revert("Ticket purchase not allowed during cooldown period");
+        }
+        
+        // Normal ticket purchase logic
+        uint256 price = getPrice(quantity);
+        if (msg.value != price) revert IncorrectPaymentAmount();
+        
+        // Calculate current day
         Storage storage s = _getStorage();
         
-        // Use memory instead of storage reference since we only read
-        address[] memory participants = s.ticketsByDay[drawDay];
-        uint256 participantCount = participants.length;
-        
-        uint256 pot = s.dailyPot[drawDay];
-        s.dailyPot[drawDay] = 0;
-
-        // Pseudo-random selection
-        uint256 winnerIndex;
-        unchecked {
-            winnerIndex = uint256(keccak256(abi.encodePacked(blockhash(block.number - 1), block.timestamp))) % participantCount;
+        // Track tickets by day - first purchase adds to array
+        if (s.userTicketCountByDay[today][msg.sender] == 0) {
+            s.ticketsByDay[today].push(msg.sender);
         }
-        address winner = participants[winnerIndex];
-
-        // Calculate amounts with unchecked math
-        uint256 adminAmount;
-        uint256 projectAmount;
-        uint256 winnerAmount;
         
-        unchecked {
-            // Use constants directly to save gas
-            uint256 PERCENT_DIVISOR = 100;
-            uint256 PROJECT_SHARE = 50;
-            
-            adminAmount = (pot * s.adminShare) / PERCENT_DIVISOR;
-            projectAmount = (pot * PROJECT_SHARE) / PERCENT_DIVISOR;
-            winnerAmount = pot - adminAmount - projectAmount;
-        }
-
-        // Distribute prizes
-        payable(s.openSourceRecipient).transfer(projectAmount);
-        payable(s.admin).transfer(adminAmount);
-        payable(winner).transfer(winnerAmount);
-
-        emit DailyDrawPerformed(drawDay, winner, winnerAmount);
+        // Update ticket count
+        s.userTicketCountByDay[today][msg.sender] += quantity;
+        
+        // Add to daily pot
+        s.dailyPot[today] += msg.value;
+        
+        emit TicketsPurchased(msg.sender, today, quantity, msg.value);
     }
     
     /**
@@ -104,14 +97,14 @@ contract OSDrawDraw is OSDrawTickets, OSDrawVRF {
         // Ensure there's a balance to distribute
         if (pool.ethBalance == 0) revert InsufficientPot();
         
-        // If VRF is configured, use it
-        if (s.entropySource != address(0)) {
-            // Use VRF for true randomness
-            requestRandomDraw(poolId, msg.sender);
-            // The actual draw will happen in the callback
-        } else {
-            // Not implemented for legacy mode yet
-            revert("Pool draws require VRF");
-        }
+        // Cache entropy source
+        address entropySource = s.entropySource;
+        
+        // Require VRF to be configured
+        if (entropySource == address(0)) revert VRFNotConfigured();
+        
+        // Use VRF for true randomness
+        requestRandomDraw(poolId, msg.sender);
+        // The actual draw will happen in the callback
     }
 } 

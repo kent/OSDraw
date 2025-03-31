@@ -14,6 +14,22 @@ contract OSDrawPools is OSDrawStorage {
     // Basis points for percentage calculations (100% = 10000)
     uint16 private constant BPS = 10000;
     
+    // Simple reentrancy guard
+    uint256 private constant _NOT_ENTERED = 1;
+    uint256 private constant _ENTERED = 2;
+    uint256 private _status;
+    
+    /**
+     * Prevents a contract from calling itself, directly or indirectly.
+     */
+    modifier nonReentrant() virtual {
+        Storage storage s = _getStorage();
+        require(s.reentrancyStatus != _ENTERED, "ReentrancyGuard: reentrant call");
+        s.reentrancyStatus = _ENTERED;
+        _;
+        s.reentrancyStatus = _NOT_ENTERED;
+    }
+    
     /**
      * Get details for a specific pool
      * @param poolId The ID of the pool
@@ -28,10 +44,22 @@ contract OSDrawPools is OSDrawStorage {
      * @param params The pool parameters
      */
     function createPool(Pool calldata params) public onlyAdmin {
+        // Validate pool parameters
+        if (params.ticketPrice == 0) revert InvalidPoolParameters();
+        
+        // Cap ticket price to reasonable amounts to prevent user errors
+        if (params.ticketPrice > 10 ether) revert InvalidPoolParameters();
+        
         Storage storage s = _getStorage();
         
         // Increment pool ID and create new pool
         uint256 newPoolId = s.config.currentPoolId + 1;
+        
+        // Prevent collision with day IDs
+        if (newPoolId < Constants.POOL_ID_THRESHOLD) {
+            newPoolId = Constants.POOL_ID_THRESHOLD;
+        }
+        
         s.config.currentPoolId = newPoolId;
         
         // Set pool parameters
@@ -40,7 +68,6 @@ contract OSDrawPools is OSDrawStorage {
         pool.totalSold = 0;
         pool.totalRedeemed = 0;
         pool.ethBalance = 0;
-        pool.oddsBPS = params.oddsBPS;
         pool.active = params.active;
         
         emit PoolCreated(newPoolId, params.ticketPrice, params.active);
@@ -52,6 +79,15 @@ contract OSDrawPools is OSDrawStorage {
      * @param params The new pool parameters
      */
     function updatePool(uint256 poolId, Pool calldata params) public onlyAdmin {
+        // Validate pool ID
+        if (poolId == 0 || poolId < Constants.POOL_ID_THRESHOLD) revert PoolNotFound();
+        
+        // Validate pool parameters
+        if (params.ticketPrice == 0) revert InvalidPoolParameters();
+        
+        // Cap ticket price to reasonable amounts
+        if (params.ticketPrice > 10 ether) revert InvalidPoolParameters();
+        
         Storage storage s = _getStorage();
         
         // Check pool exists
@@ -60,7 +96,6 @@ contract OSDrawPools is OSDrawStorage {
         
         // Update pool parameters
         pool.ticketPrice = params.ticketPrice;
-        pool.oddsBPS = params.oddsBPS;
         pool.active = params.active;
         
         emit PoolUpdated(poolId, params.ticketPrice, params.active);
@@ -87,7 +122,7 @@ contract OSDrawPools is OSDrawStorage {
      * Add ETH liquidity to a pool
      * @param poolId The ID of the pool
      */
-    function addLiquidity(uint256 poolId) external payable onlyAdmin {
+    function addLiquidity(uint256 poolId) external payable onlyAdmin nonReentrant {
         Storage storage s = _getStorage();
         
         // Check pool exists
@@ -133,7 +168,7 @@ contract OSDrawPools is OSDrawStorage {
     /**
      * Access control: only admin can call functions with this modifier
      */
-    modifier onlyAdmin() {
+    modifier onlyAdmin() virtual {
         if (msg.sender != _getStorage().admin) revert Unauthorized();
         _;
     }

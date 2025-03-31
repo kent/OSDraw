@@ -86,20 +86,12 @@ contract DeployOSDraw is Script {
         // -------------------------------------------------------------------------
         // Step 5: Create the first pool
         // -------------------------------------------------------------------------
-        // Set up some basic odds for a test pool (in basis points, 10000 = 100%)
-        uint16[] memory oddsBPS = new uint16[](3);
-        oddsBPS[0] = 5000;  // 50% chance for tier 1
-        oddsBPS[1] = 3000;  // 30% chance for tier 2
-        oddsBPS[2] = 1000;  // 10% chance for tier 3
-        // Note: Total is 90%, remaining 10% is no prize
-        
         // Create a Pool struct with the initial configuration
         Pool memory initialPool = Pool({
             ticketPrice: 0.01 ether,  // Each ticket costs 0.01 ETH
             totalSold: 0,             // No tickets sold yet
             totalRedeemed: 0,         // No tickets redeemed yet
             ethBalance: 0,            // No initial balance
-            oddsBPS: oddsBPS,         // The odds we defined above
             active: true              // The pool is active immediately
         });
         

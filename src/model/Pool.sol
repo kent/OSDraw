@@ -18,9 +18,6 @@ struct Pool {
     // Current ETH balance in the pool
     uint256 ethBalance;
     
-    // Odds configuration in basis points
-    uint16[] oddsBPS;
-    
-    // Whether this pool is active
+    // Whether this pool is active (packed with other small variables)
     bool active;
 } 

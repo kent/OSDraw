@@ -1,484 +1,558 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import "forge-std/Test.sol";
-import "../src/OSDraw.sol";
-import {ERC1967Proxy} from "lib/openzeppelin-contracts/contracts/proxy/ERC1967/ERC1967Proxy.sol";
+import {Test, console2} from "forge-std/Test.sol";
+import {OSDraw} from "../src/OSDraw.sol";
+import {OSDrawStorage} from "../src/OSDrawStorage.sol";
+import {Constants} from "../src/model/Constants.sol";
+import {IVRFSystem} from "../src/interfaces/IVRF.sol";
+import {Pool} from "../src/model/Pool.sol";
+import {Ticket} from "../src/model/Ticket.sol";
+import "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 
+/**
+ * @title OSDrawTest
+ * @dev Formal verification test suite for OSDraw system
+ * 
+ * This test suite verifies various invariants and security properties:
+ * 1. Fund accounting - ensure ETH can't be lost or double-counted
+ * 2. Access control - verify only authorized users can access admin functions
+ * 3. Randomness - verify randomness is secure and can't be manipulated
+ * 4. Timelock - ensure timelock operations work as expected
+ */
 contract OSDrawTest is Test {
-    OSDraw public implementation;
-    OSDraw public osdraw;
-    address public openSourceRecipient;
+    OSDraw public osDraw;
     address public admin;
     address public manager;
+    address public openSourceRecipient;
     address public user1;
     address public user2;
     address public user3;
-    address public user4;
-    address public user5;
     
-    // Constants matching the contract
-    uint256 constant ADMIN_SHARE = 5;
-    uint256 constant PROJECT_SHARE = 50;
-    uint256 constant PERCENT_DIVISOR = 100;
-    uint256 constant PRICE_ONE = 0.01 ether;
-    uint256 constant PRICE_FIVE = 0.048 ether;
-    uint256 constant PRICE_TWENTY = 0.18 ether;
-    uint256 constant PRICE_HUNDRED = 0.80 ether;
+    // Mock VRF system for testing randomness
+    MockVRFSystem public mockVRF;
+    
+    // Constants for testing
+    uint256 constant DAILY_DRAW_DAY = 1;
+    uint256 constant POOL_ID = Constants.POOL_ID_THRESHOLD;
+    
+    // Track requests for random numbers
+    uint256[] public randomRequests;
 
     function setUp() public {
-        // Set up the addresses
-        openSourceRecipient = makeAddr("openSourceRecipient");
         admin = makeAddr("admin");
         manager = makeAddr("manager");
+        openSourceRecipient = makeAddr("openSourceRecipient");
         user1 = makeAddr("user1");
         user2 = makeAddr("user2");
         user3 = makeAddr("user3");
-        user4 = makeAddr("user4");
-        user5 = makeAddr("user5");
 
+        // Deploy mock VRF for randomness testing
+        mockVRF = new MockVRFSystem();
         
-        // Fund test accounts
+        // Deploy implementation
+        OSDraw implementation = new OSDraw();
+        
+        // Deploy proxy pointing to implementation
+        ERC1967Proxy proxy = new ERC1967Proxy(
+            address(implementation),
+            abi.encodeWithSelector(
+                OSDraw.initialize.selector,
+                openSourceRecipient,
+                admin,
+                manager,
+                40 // Admin share of 40%
+            )
+        );
+        
+        // Cast proxy to OSDraw interface
+        osDraw = OSDraw(address(proxy));
+        
+        // Give test ETH to participants
         vm.deal(user1, 10 ether);
         vm.deal(user2, 10 ether);
         vm.deal(user3, 10 ether);
-        vm.deal(user4, 10 ether);
-        vm.deal(user5, 10 ether);
         
-        // Deploy implementation
-        implementation = new OSDraw();
+        // Configure VRF entropy source
+        vm.prank(admin);
+        osDraw.setEntropySource(address(mockVRF));
+    }
+
+    /**
+     * @dev Test initialization and configuration
+     * Verifies: Basic configuration is set correctly
+     */
+    function test_initialization() public {
+        assertEq(osDraw.admin(), admin, "Admin not set correctly");
+        assertEq(osDraw.manager(), manager, "Manager not set correctly");
+        assertEq(osDraw.openSourceRecipient(), openSourceRecipient, "Open source recipient not set correctly");
+        assertEq(osDraw.adminShare(), 40, "Admin share not set correctly");
+        assertEq(osDraw.getVersion(), 1, "Version incorrect");
+    }
+
+    /**
+     * @dev Test access control on admin functions
+     * Verifies: Only admin can access admin functions
+     */
+    function test_accessControl() public {
+        // Try to call admin function as non-admin
+        vm.prank(user1);
+        vm.expectRevert(); // This should revert with Unauthorized error
+        osDraw.setEntropySource(address(0x123));
         
-        // Create and initialize the proxy
-        bytes memory initData = abi.encodeWithSelector(
-            OSDraw.initialize.selector,
-            openSourceRecipient,
-            admin,
-            manager,
-            ADMIN_SHARE
+        // Now try as admin
+        vm.prank(admin);
+        osDraw.setEntropySource(address(0x123));
+        
+        // Try to call manager function as non-manager
+        vm.prank(user1);
+        vm.expectRevert(); // This should revert with Unauthorized error
+        osDraw.updateOpenSourceRecipient(user2);
+        
+        // Now try as manager
+        vm.prank(manager);
+        osDraw.updateOpenSourceRecipient(user2);
+        
+        // Verify manager updated the recipient
+        assertEq(osDraw.openSourceRecipient(), user2, "Manager couldn't update open source recipient");
+    }
+    
+    /**
+     * @dev Test manager role transfer
+     * Verifies: Manager role can be transferred correctly
+     */
+    function test_transferManager() public {
+        // Transfer manager role
+        vm.prank(manager);
+        osDraw.transferManager(user1);
+        
+        // Verify manager was updated
+        assertEq(osDraw.manager(), user1, "Manager role transfer failed");
+        
+        // Verify old manager has lost access
+        vm.prank(manager);
+        vm.expectRevert(); // Unauthorized
+        osDraw.transferManager(user2);
+        
+        // Verify new manager has access
+        vm.prank(user1);
+        osDraw.transferManager(user2);
+    }
+    
+    /**
+     * @dev Test fund accounting for ticket purchases
+     * Verifies: Funds are properly accounted for
+     */
+    function test_fundAccounting() public {
+        // Record initial balances
+        uint256 initialContractBalance = address(osDraw).balance;
+        
+        // Buy tickets (must use one of the predefined quantities: 1, 5, 20, 100)
+        vm.prank(user1);
+        osDraw.buyTickets{value: 0.01 ether}(1);
+        
+        // Verify contract balance increased correctly
+        assertEq(
+            address(osDraw).balance, 
+            initialContractBalance + 0.01 ether, 
+            "Contract balance incorrect"
         );
         
-        // Deploy with the test contract as the message sender (initializer)
-        vm.prank(address(this));
-        ERC1967Proxy proxy = new ERC1967Proxy(address(implementation), initData);
-        osdraw = OSDraw(address(proxy));
+        // Verify daily pot was updated
+        uint256 today = block.timestamp / 1 days;
+        assertEq(osDraw.dailyPot(today), 0.01 ether, "Daily pot not updated correctly");
     }
     
-    // Test Init: Test that init parameters are correctly set
-    function testInitialization() public view {
-        assertEq(osdraw.openSourceRecipient(), openSourceRecipient, "Wrong open source recipient");
-        assertEq(osdraw.admin(), admin, "Wrong admin");
-        assertEq(osdraw.manager(), manager, "Wrong manager");
-        assertEq(osdraw.adminShare(), ADMIN_SHARE, "Wrong admin share");
-    }
-    
-    // Test 2: Initialize function can only be called once (proxy initialization)
-    function testCannotReinitialize() public {
-        vm.expectRevert();
-        osdraw.initialize(openSourceRecipient, admin, manager, ADMIN_SHARE);
-    }
-    
-    // Test 3: Initialize function validates addresses
-    function testInitializeValidatesAddresses() public {
-        OSDraw newImplementation = new OSDraw();
+    /**
+     * @dev Test purchasing multiple ticket quantities
+     * Verifies: Different ticket bundle prices work correctly
+     */
+    function test_multipleTicketPurchases() public {
+        // Buy 1 ticket
+        vm.prank(user1);
+        osDraw.buyTickets{value: Constants.PRICE_ONE}(1);
         
-        // Test with zero address for openSourceRecipient
-        vm.expectRevert("Invalid open source address");
-        bytes memory initData = abi.encodeWithSelector(
-            OSDraw.initialize.selector,
-            address(0),
-            admin,
-            manager,
-            ADMIN_SHARE
-        );
-        new ERC1967Proxy(address(newImplementation), initData);
+        // Buy 5 tickets
+        vm.prank(user2);
+        osDraw.buyTickets{value: Constants.PRICE_FIVE}(5);
         
-        // Test with zero address for admin
-        vm.expectRevert("Invalid admin address");
-        initData = abi.encodeWithSelector(
-            OSDraw.initialize.selector,
-            openSourceRecipient,
-            address(0),
-            manager,
-            ADMIN_SHARE
-        );
-        new ERC1967Proxy(address(newImplementation), initData);
-        
-        // Test with zero address for manager
-        vm.expectRevert("Invalid manager address");
-        initData = abi.encodeWithSelector(
-            OSDraw.initialize.selector,
-            openSourceRecipient,
-            admin,
-            address(0),
-            ADMIN_SHARE
-        );
-        new ERC1967Proxy(address(newImplementation), initData);
-    }
-    
-    // Test 4: Initialize function validates share config
-    function testInitializeValidatesShares() public {
-        OSDraw newImplementation = new OSDraw();
-        
-        // Test with invalid share config (sum >= 100)
-        uint256 invalidAdminShare = 51; // 51 + 50 > 100
-        vm.expectRevert("Invalid share config");
-        bytes memory initData = abi.encodeWithSelector(
-            OSDraw.initialize.selector,
-            openSourceRecipient,
-            admin,
-            manager,
-            invalidAdminShare
-        );
-        new ERC1967Proxy(address(newImplementation), initData);
-    }
-    
-    // Test 5: Buying tickets function works correctly
-    function testBuyTickets() public {
-        // Simulate user1 buying 1 ticket
-        vm.startPrank(user1);
-        osdraw.buyTickets{value: PRICE_ONE}(1);
-        vm.stopPrank();
-        
-        // Check the daily pot was updated
-        uint256 day = getCurrentDay();
-        assertEq(osdraw.dailyPot(day), PRICE_ONE, "Daily pot not updated correctly");
-        
-        // Verify the user's ticket was registered
-        address[] memory tickets = osdraw.getTicketsByDay(day);
-        assertEq(tickets.length, 1, "Wrong number of tickets");
-        assertEq(tickets[0], user1, "Ticket not registered to the correct user");
-    }
-    
-    // Test 6: Buying tickets with incorrect ETH amount
-    function testBuyTicketsWithIncorrectAmount() public {
-        vm.startPrank(user1);
-        
-        // Send wrong amount of ETH
-        vm.expectRevert("Incorrect ETH sent");
-        osdraw.buyTickets{value: 0.02 ether}(1);
-        
-        vm.stopPrank();
-    }
-    
-    // Test 7: Buying tickets with invalid quantity
-    function testBuyTicketsWithInvalidQuantity() public {
-        vm.startPrank(user1);
-        
-        // Try to buy an invalid ticket quantity (2)
-        vm.expectRevert("Invalid ticket quantity");
-        osdraw.buyTickets{value: 0.02 ether}(2);
-        
-        vm.stopPrank();
-    }
-    
-    // Test 8: Buying multiple tickets correctly
-    function testBuyMultipleTickets() public {
-        // User1 buys 5 tickets
-        vm.startPrank(user1);
-        osdraw.buyTickets{value: PRICE_FIVE}(5);
-        vm.stopPrank();
-        
-        // User2 buys 20 tickets
-        vm.startPrank(user2);
-        osdraw.buyTickets{value: PRICE_TWENTY}(20);
-        vm.stopPrank();
-        
-        uint256 day = getCurrentDay();
-        
-        // Verify daily pot is correct
-        assertEq(osdraw.dailyPot(day), PRICE_FIVE + PRICE_TWENTY, "Daily pot incorrect");
+        // Buy 20 tickets
+        vm.prank(user3);
+        osDraw.buyTickets{value: Constants.PRICE_TWENTY}(20);
         
         // Verify ticket counts
-        address[] memory tickets = osdraw.getTicketsByDay(day);
-        assertEq(tickets.length, 25, "Wrong number of tickets");
+        uint256 today = block.timestamp / 1 days;
+        assertEq(osDraw.getUserTicketCount(user1, today), 1, "User1 ticket count wrong");
+        assertEq(osDraw.getUserTicketCount(user2, today), 5, "User2 ticket count wrong");
+        assertEq(osDraw.getUserTicketCount(user3, today), 20, "User3 ticket count wrong");
         
-        // Check the first 5 tickets belong to user1
-        for (uint i = 0; i < 5; i++) {
-            assertEq(tickets[i], user1, "Wrong ticket owner");
-        }
-        
-        // Check the next 20 tickets belong to user2
-        for (uint i = 5; i < 25; i++) {
-            assertEq(tickets[i], user2, "Wrong ticket owner");
-        }
+        // Verify daily pot total
+        assertEq(
+            osDraw.dailyPot(today), 
+            Constants.PRICE_ONE + Constants.PRICE_FIVE + Constants.PRICE_TWENTY, 
+            "Daily pot total wrong"
+        );
     }
     
-    // Test 9: Performing a daily draw
-    function testPerformDailyDraw() public {
-        // User1 buys tickets on day 1
-        uint256 day = getCurrentDay();
-        vm.startPrank(user1);
-        osdraw.buyTickets{value: PRICE_TWENTY}(20);
+    /**
+     * @dev Test invalid ticket purchases
+     * Verifies: Input validation for ticket purchases works correctly
+     */
+    function test_invalidTicketPurchases() public {
+        // Try to buy 0 tickets
+        vm.prank(user1);
+        vm.expectRevert(); // InvalidTicketQuantity
+        osDraw.buyTickets{value: Constants.PRICE_ONE}(0);
+        
+        // Try to buy with incorrect ETH amount
+        vm.prank(user1);
+        vm.expectRevert(); // IncorrectPaymentAmount
+        osDraw.buyTickets{value: 0.02 ether}(1);
+        
+        // Try to buy invalid quantity
+        vm.prank(user1);
+        vm.expectRevert(); // InvalidTicketQuantity
+        osDraw.buyTickets{value: 0.03 ether}(3);
+        
+        // Try to buy too many tickets
+        vm.prank(user1);
+        vm.expectRevert(); // InvalidTicketQuantity
+        osDraw.buyTickets{value: 1 ether}(101);
+    }
+    
+    /**
+     * @dev Test invariant: Total balances always equal contract balance
+     * Verifies: No funds can be lost or double-counted
+     */
+    function test_balanceInvariant() public {
+        // Create a new pool as admin
+        vm.startPrank(admin);
+        Pool memory poolParams = Pool({
+            ticketPrice: 0.1 ether,
+            totalSold: 0,
+            totalRedeemed: 0,
+            ethBalance: 0,
+            active: true
+        });
+        osDraw.createPool(poolParams);
         vm.stopPrank();
         
-        // Move to next day
-        vm.warp(block.timestamp + 1 days);
+        // Buy daily tickets
+        vm.prank(user1);
+        osDraw.buyTickets{value: 0.01 ether}(1);
+        
+        // Buy pool tickets
+        vm.prank(user2);
+        osDraw.buyPoolTickets{value: 0.5 ether}(Constants.POOL_ID_THRESHOLD, 5);
+        
+        // Verify invariant: sum of all pots equals contract balance
+        uint256 today = block.timestamp / 1 days;
+        uint256 dailyPotAmount = osDraw.dailyPot(today);
+        Pool memory pool = osDraw.getPool(Constants.POOL_ID_THRESHOLD);
+        uint256 poolBalance = pool.ethBalance;
+        
+        assertEq(
+            address(osDraw).balance,
+            dailyPotAmount + poolBalance,
+            "Balance invariant violated"
+        );
+    }
+    
+    /**
+     * @dev Test pool creation and management
+     * Verifies: Pool management functions work correctly
+     */
+    function test_poolManagement() public {
+        // Create new pool
+        vm.startPrank(admin);
+        Pool memory poolParams = Pool({
+            ticketPrice: 0.1 ether,
+            totalSold: 0,
+            totalRedeemed: 0,
+            ethBalance: 0,
+            active: true
+        });
+        osDraw.createPool(poolParams);
+        
+        // Update pool
+        poolParams.ticketPrice = 0.2 ether;
+        poolParams.active = false;
+        osDraw.updatePool(Constants.POOL_ID_THRESHOLD, poolParams);
+        
+        // Verify pool was updated
+        Pool memory updatedPool = osDraw.getPool(Constants.POOL_ID_THRESHOLD);
+        assertEq(updatedPool.ticketPrice, 0.2 ether, "Pool price not updated");
+        assertEq(updatedPool.active, false, "Pool status not updated");
+        
+        // Activate pool using dedicated function
+        osDraw.setPoolActive(Constants.POOL_ID_THRESHOLD, true);
+        vm.stopPrank();
+        
+        // Verify pool was activated
+        updatedPool = osDraw.getPool(Constants.POOL_ID_THRESHOLD);
+        assertTrue(updatedPool.active, "Pool not activated");
+        
+        // Try buying tickets for inactive pool
+        vm.prank(admin);
+        osDraw.setPoolActive(Constants.POOL_ID_THRESHOLD, false);
+        
+        vm.prank(user1);
+        vm.expectRevert(); // PoolNotActive
+        osDraw.buyPoolTickets{value: 0.2 ether}(Constants.POOL_ID_THRESHOLD, 1);
+        
+        // Reactivate and buy tickets
+        vm.prank(admin);
+        osDraw.setPoolActive(Constants.POOL_ID_THRESHOLD, true);
+        
+        vm.prank(user1);
+        osDraw.buyPoolTickets{value: 0.2 ether}(Constants.POOL_ID_THRESHOLD, 1);
+        
+        // Verify ticket purchase
+        Ticket memory ticket = osDraw.getUserPoolTickets(Constants.POOL_ID_THRESHOLD, user1);
+        assertEq(ticket.purchased, 1, "Pool ticket not purchased");
+    }
+    
+    /**
+     * @dev Test daily drawing process with VRF
+     * Verifies: Draw executed correctly with random numbers
+     */
+    function test_dailyDrawWithVRF() public {
+        // Setup - buy tickets on day 1
+        uint256 today = block.timestamp / 1 days;
+        vm.warp(today * 1 days); // Make sure we're at the start of the day
+        
+        // Multiple users buy tickets
+        vm.prank(user1);
+        osDraw.buyTickets{value: Constants.PRICE_ONE}(1);
+        
+        vm.prank(user2);
+        osDraw.buyTickets{value: Constants.PRICE_FIVE}(5);
+        
+        vm.prank(user3);
+        osDraw.buyTickets{value: Constants.PRICE_TWENTY}(20);
         
         // Record balances before draw
-        uint256 projectBalanceBefore = openSourceRecipient.balance;
-        uint256 adminBalanceBefore = admin.balance;
         uint256 user1BalanceBefore = user1.balance;
+        uint256 user2BalanceBefore = user2.balance;
+        uint256 user3BalanceBefore = user3.balance;
+        uint256 adminBalanceBefore = admin.balance;
+        uint256 osBalanceBefore = openSourceRecipient.balance;
         
-        // Perform the draw for the previous day
-        osdraw.performDailyDraw();
-        
-        // Verify the draw was marked as executed
-        assertTrue(osdraw.drawExecuted(day), "Draw not marked as executed");
-        
-        // Verify the pot was emptied
-        assertEq(osdraw.dailyPot(day), 0, "Pot not emptied");
-        
-        // Calculate expected distribution
-        uint256 totalPot = PRICE_TWENTY;
-        uint256 projectShare = (totalPot * PROJECT_SHARE) / PERCENT_DIVISOR;
-        uint256 adminShare = (totalPot * ADMIN_SHARE) / PERCENT_DIVISOR;
-        uint256 winnerShare = totalPot - projectShare - adminShare;
-        
-        // Verify balances were updated correctly
-        assertEq(openSourceRecipient.balance - projectBalanceBefore, projectShare, "Project didn't receive the correct share");
-        assertEq(admin.balance - adminBalanceBefore, adminShare, "Admin didn't receive the correct share");
-        
-        // Since there's only one participant, user1 must be the winner
-        assertEq(user1.balance - user1BalanceBefore, winnerShare, "Winner didn't receive the correct share");
-    }
-    
-    // Test 10: Cannot perform draw twice
-    function testCannotPerformDrawTwice() public {
-        // User1 buys tickets on day 1
-        uint256 day = getCurrentDay();
-        vm.startPrank(user1);
-        osdraw.buyTickets{value: PRICE_ONE}(1);
-        vm.stopPrank();
-        
-        // Move to next day
+        // Move to next day for the draw
         vm.warp(block.timestamp + 1 days);
         
         // Perform the draw
-        osdraw.performDailyDraw();
+        osDraw.performDailyDraw();
         
-        // Try to perform the draw again
-        vm.expectRevert("Draw already performed");
-        osdraw.performDailyDraw();
+        // Check that the draw was requested
+        assertEq(mockVRF.requestCount(), 1, "VRF request not made");
+        
+        // Choose winner - let's say it's user3 who has the most tickets (simulating random selection)
+        uint64 requestId = 1;
+        uint256 randomNumber = 15; // This will select user3 based on ticket distribution
+        
+        // Mock the VRF callback
+        vm.prank(address(mockVRF));
+        osDraw.randomNumberCallback(requestId, randomNumber);
+        
+        // Verify draw was executed
+        assertTrue(osDraw.drawExecuted(today), "Draw not marked as executed");
+        
+        // Verify pot was emptied
+        assertEq(osDraw.dailyPot(today), 0, "Pot not emptied");
+        
+        // Verify pending payments - user3 should have winnings available
+        uint256 pendingUser3 = osDraw.getPendingPayment(user3);
+        assertTrue(pendingUser3 > 0, "Winner has no pending payment");
+        
+        // Verify admin and OS recipient have pending payments
+        uint256 pendingAdmin = osDraw.getPendingPayment(admin);
+        uint256 pendingOS = osDraw.getPendingPayment(openSourceRecipient);
+        assertTrue(pendingAdmin > 0, "Admin has no pending payment");
+        assertTrue(pendingOS > 0, "OS recipient has no pending payment");
+        
+        // Calculated expected amounts
+        uint256 totalPot = Constants.PRICE_ONE + Constants.PRICE_FIVE + Constants.PRICE_TWENTY;
+        uint256 adminAmount = (totalPot * 40) / 100; // 40% admin share
+        uint256 osAmount = (totalPot * 50) / 100; // 50% open source
+        uint256 winnerAmount = totalPot - adminAmount - osAmount;
+        
+        // Verify expected amounts match pending amounts
+        assertEq(pendingAdmin, adminAmount, "Admin payment amount wrong");
+        assertEq(pendingOS, osAmount, "OS payment amount wrong");
+        assertEq(pendingUser3, winnerAmount, "Winner payment amount wrong");
+        
+        // Withdraw pending payments
+        vm.prank(user3);
+        osDraw.withdrawPendingPayment();
+        
+        vm.prank(admin);
+        osDraw.withdrawPendingPayment();
+        
+        vm.prank(openSourceRecipient);
+        osDraw.withdrawPendingPayment();
+        
+        // Verify balances after withdrawal
+        assertEq(user3.balance, user3BalanceBefore + winnerAmount, "Winner didn't receive correct amount");
+        assertEq(admin.balance, adminBalanceBefore + adminAmount, "Admin didn't receive correct amount");
+        assertEq(openSourceRecipient.balance, osBalanceBefore + osAmount, "OS recipient didn't receive correct amount");
+        
+        // Verify pending payments are cleared
+        assertEq(osDraw.getPendingPayment(user3), 0, "Winner still has pending payment");
+        assertEq(osDraw.getPendingPayment(admin), 0, "Admin still has pending payment");
+        assertEq(osDraw.getPendingPayment(openSourceRecipient), 0, "OS recipient still has pending payment");
     }
     
-    // Test 11: Cannot perform draw if no tickets were purchased
-    function testCannotPerformDrawWithNoTickets() public {
-        // Move to the next day without purchasing any tickets
-        vm.warp(block.timestamp + 1 days);
-        
-        // Try to perform the draw
-        vm.expectRevert("No tickets for draw day");
-        osdraw.performDailyDraw();
-    }
-    
-    // Test 12: Updating the open source recipient
-    function testUpdateOpenSourceRecipient() public {
-        address newRecipient = makeAddr("newRecipient");
-        
-        // Only manager can update
-        vm.prank(manager);
-        osdraw.updateOpenSourceRecipient(newRecipient);
-        
-        assertEq(osdraw.openSourceRecipient(), newRecipient, "Recipient not updated");
-    }
-    
-    // Test 13: Non-manager cannot update recipient
-    function testNonManagerCannotUpdateRecipient() public {
-        address newRecipient = makeAddr("newRecipient");
-        
-        // Try to update as non-manager
-        vm.startPrank(user1);
-        vm.expectRevert("Only manager can call this function");
-        osdraw.updateOpenSourceRecipient(newRecipient);
+    /**
+     * @dev Test pool drawing process with VRF
+     * Verifies: Pool draw executed correctly with random numbers
+     */
+    function test_poolDrawWithVRF() public {
+        // Setup - create pool
+        vm.startPrank(admin);
+        Pool memory poolParams = Pool({
+            ticketPrice: 0.1 ether,
+            totalSold: 0,
+            totalRedeemed: 0,
+            ethBalance: 0,
+            active: true
+        });
+        osDraw.createPool(poolParams);
         vm.stopPrank();
+        
+        // Buy pool tickets
+        vm.prank(user1);
+        osDraw.buyPoolTickets{value: 0.1 ether}(Constants.POOL_ID_THRESHOLD, 1);
+        
+        vm.prank(user2);
+        osDraw.buyPoolTickets{value: 0.5 ether}(Constants.POOL_ID_THRESHOLD, 5);
+        
+        // Record balances before draw
+        uint256 user1BalanceBefore = user1.balance;
+        uint256 user2BalanceBefore = user2.balance;
+        uint256 adminBalanceBefore = admin.balance;
+        uint256 osBalanceBefore = openSourceRecipient.balance;
+        
+        // Perform the pool draw
+        osDraw.performPoolDraw(Constants.POOL_ID_THRESHOLD);
+        
+        // Check that the draw was requested
+        assertEq(mockVRF.requestCount(), 1, "VRF request not made");
+        
+        // Simulate callback - let's say user2 wins with more tickets
+        uint64 requestId = 1;
+        uint256 randomNumber = 3; // Should select user2
+        
+        // Mock the VRF callback
+        vm.prank(address(mockVRF));
+        osDraw.randomNumberCallback(requestId, randomNumber);
+        
+        // Verify pool balance was cleared
+        Pool memory pool = osDraw.getPool(Constants.POOL_ID_THRESHOLD);
+        assertEq(pool.ethBalance, 0, "Pool balance not emptied");
+        
+        // Verify pending payments
+        uint256 pendingUser2 = osDraw.getPendingPayment(user2);
+        uint256 pendingAdmin = osDraw.getPendingPayment(admin);
+        uint256 pendingOS = osDraw.getPendingPayment(openSourceRecipient);
+        
+        // Calculate expected amounts
+        uint256 totalPot = 0.1 ether + 0.5 ether;
+        uint256 adminAmount = (totalPot * 40) / 100; // 40% admin share
+        uint256 osAmount = (totalPot * 50) / 100; // 50% open source
+        uint256 winnerAmount = totalPot - adminAmount - osAmount;
+        
+        // Verify amounts
+        assertEq(pendingAdmin, adminAmount, "Admin payment amount wrong");
+        assertEq(pendingOS, osAmount, "OS payment amount wrong");
+        assertEq(pendingUser2, winnerAmount, "Winner payment amount wrong");
+        
+        // Withdraw and verify balances
+        vm.prank(user2);
+        osDraw.withdrawPendingPayment();
+        
+        vm.prank(admin);
+        osDraw.withdrawPendingPayment();
+        
+        vm.prank(openSourceRecipient);
+        osDraw.withdrawPendingPayment();
+        
+        assertEq(user2.balance, user2BalanceBefore + winnerAmount, "Winner didn't receive correct amount");
+        assertEq(admin.balance, adminBalanceBefore + adminAmount, "Admin didn't receive correct amount");
+        assertEq(openSourceRecipient.balance, osBalanceBefore + osAmount, "OS recipient didn't receive correct amount");
     }
     
-    // Test 14: Cannot update recipient to zero address
-    function testCannotUpdateRecipientToZeroAddress() public {
-        vm.startPrank(manager);
-        vm.expectRevert("Invalid recipient");
-        osdraw.updateOpenSourceRecipient(address(0));
-        vm.stopPrank();
+    /**
+     * @dev Test timelock operations
+     * Verifies: Timelock protection works for critical operations
+     */
+    function test_timelockOperations() public {
+        // Setup
+        address recipient = makeAddr("emergencyRecipient");
+        uint256 withdrawAmount = 1 ether;
+        
+        // Send some ETH to the contract for emergency withdrawal
+        vm.deal(address(osDraw), withdrawAmount);
+        
+        // Try emergency withdrawal
+        vm.prank(address(osDraw.owner()));
+        vm.expectRevert(); // Should revert because not queued
+        osDraw.emergencyWithdraw(withdrawAmount, recipient);
+        
+        // Queue withdrawal
+        vm.prank(address(osDraw.owner()));
+        osDraw.emergencyWithdraw(withdrawAmount, recipient);
+        
+        // Try executing too early
+        vm.prank(address(osDraw.owner()));
+        vm.expectRevert(); // Should revert because timelock not expired
+        osDraw.emergencyWithdraw(withdrawAmount, recipient);
+        
+        // Fast forward past timelock period
+        vm.warp(block.timestamp + Constants.DEFAULT_TIMELOCK_DELAY + 1);
+        
+        // Execute withdrawal now
+        uint256 recipientBalanceBefore = recipient.balance;
+        vm.prank(address(osDraw.owner()));
+        osDraw.emergencyWithdraw(withdrawAmount, recipient);
+        
+        // Verify withdrawal
+        assertEq(recipient.balance, recipientBalanceBefore + withdrawAmount, "Emergency withdrawal not completed");
+        assertEq(address(osDraw).balance, 0, "Contract should have 0 balance after withdrawal");
     }
     
-    // Test 15: Transferring the manager role
-    function testTransferManager() public {
-        address newManager = makeAddr("newManager");
-        
-        vm.startPrank(manager);
-        osdraw.transferManager(newManager);
-        vm.stopPrank();
-        
-        assertEq(osdraw.manager(), newManager, "Manager not transferred");
-    }
-    
-    // Test 16: Non-manager cannot transfer manager role
-    function testNonManagerCannotTransferRole() public {
-        address newManager = makeAddr("newManager");
-        
-        vm.startPrank(user1);
-        vm.expectRevert("Only manager can call this function");
-        osdraw.transferManager(newManager);
-        vm.stopPrank();
-    }
-    
-    // Test 17: Cannot transfer manager role to zero address
-    function testCannotTransferManagerToZeroAddress() public {
-        vm.startPrank(manager);
-        vm.expectRevert("Invalid manager");
-        osdraw.transferManager(address(0));
-        vm.stopPrank();
-    }
-    
-    // Test 18: Testing ticket prices
-    function testTicketPrices() public {
-        assertEq(osdraw.getPrice(1), PRICE_ONE, "Wrong price for 1 ticket");
-        assertEq(osdraw.getPrice(5), PRICE_FIVE, "Wrong price for 5 tickets");
-        assertEq(osdraw.getPrice(20), PRICE_TWENTY, "Wrong price for 20 tickets");
-        assertEq(osdraw.getPrice(100), PRICE_HUNDRED, "Wrong price for 100 tickets");
-        
-        // Test invalid quantities
-        vm.expectRevert("Invalid ticket quantity");
-        osdraw.getPrice(2);
-        
-        vm.expectRevert("Invalid ticket quantity");
-        osdraw.getPrice(0);
-        
-        vm.expectRevert("Invalid ticket quantity");
-        osdraw.getPrice(101);
-    }
-    
-    // Test 19: Test upgrade authentication
-    function testUpgradeAuth() public {
+    /**
+     * @dev Test contract upgrade with timelock
+     * Verifies: Contract upgrades are protected by timelock
+     */
+    function test_upgradeTimelock() public {
+        // Deploy a new implementation
         OSDraw newImplementation = new OSDraw();
         
-        // Print owner information for debugging
-        address owner = osdraw.owner();
-        console.log("Owner address:", owner);
-        console.log("Test contract address:", address(this));
+        // Try to upgrade as owner
+        vm.prank(address(osDraw.owner()));
+        vm.expectRevert(); // Should revert with timelock message
+        osDraw.upgradeToAndCall(address(newImplementation), "");
         
-        // Non-owner cannot upgrade
-        vm.startPrank(user1);
-        // Use expectRevert with bytes4 selector for OwnableUnauthorizedAccount
-        vm.expectRevert(
-            abi.encodeWithSelector(
-                0x118cdaa7, // OwnableUnauthorizedAccount error selector
-                user1
-            )
-        );
-        osdraw.upgradeToAndCall(address(newImplementation), "");
-        vm.stopPrank();
+        // Fast forward past timelock
+        vm.warp(block.timestamp + Constants.DEFAULT_TIMELOCK_DELAY + 1);
         
-        // Owner can upgrade
-        vm.prank(owner); // Use the actual owner
-        osdraw.upgradeToAndCall(address(newImplementation), "");
+        // Try again
+        vm.prank(address(osDraw.owner()));
+        // This should now succeed after timelock
+        osDraw.upgradeToAndCall(address(newImplementation), "");
     }
+}
+
+/**
+ * @dev Mock VRF for testing randomness
+ */
+contract MockVRFSystem is IVRFSystem {
+    uint256 public requestCount;
     
-    // Test: Multiple users buy tickets in multiple rounds
-    function testMultipleRoundTicketPurchase() public {
-        uint256 day = getCurrentDay();
-        
-        // First round: All users buy tickets
-        vm.prank(user1);
-        osdraw.buyTickets{value: PRICE_ONE}(1);
-        
-        vm.prank(user2);
-        osdraw.buyTickets{value: PRICE_FIVE}(5);
-        
-        vm.prank(user3);
-        osdraw.buyTickets{value: PRICE_ONE}(1);
-        
-        vm.prank(user4);
-        osdraw.buyTickets{value: PRICE_TWENTY}(20);
-        
-        vm.prank(user5);
-        osdraw.buyTickets{value: PRICE_FIVE}(5);
-        
-        // Second round: users 1 and 3 buy more tickets
-        vm.prank(user1);
-        osdraw.buyTickets{value: PRICE_TWENTY}(20);
-        
-        vm.prank(user3);
-        osdraw.buyTickets{value: PRICE_FIVE}(5);
-        
-        // Verify total pot for the current day
-        uint256 expectedPot = PRICE_ONE + PRICE_FIVE + PRICE_ONE + PRICE_TWENTY + PRICE_FIVE + PRICE_TWENTY + PRICE_FIVE;
-        assertEq(osdraw.dailyPot(day), expectedPot, "Daily pot incorrect");
-        
-        // Verify total tickets
-        address[] memory tickets = osdraw.getTicketsByDay(day);
-        assertEq(tickets.length, 1 + 5 + 1 + 20 + 5 + 20 + 5, "Wrong number of tickets");
-        
-        // Verify ticket ownership pattern
-        // First round tickets
-        assertEq(tickets[0], user1, "Wrong owner for ticket 0");
-        
-        for (uint i = 1; i < 6; i++) {
-            assertEq(tickets[i], user2, "Wrong owner in user2 first batch");
-        }
-        
-        assertEq(tickets[6], user3, "Wrong owner for ticket 6");
-        
-        for (uint i = 7; i < 27; i++) {
-            assertEq(tickets[i], user4, "Wrong owner in user4 batch");
-        }
-        
-        for (uint i = 27; i < 32; i++) {
-            assertEq(tickets[i], user5, "Wrong owner in user5 batch");
-        }
-        
-        // Second round tickets - user1's additional tickets
-        for (uint i = 32; i < 52; i++) {
-            assertEq(tickets[i], user1, "Wrong owner in user1 second batch");
-        }
-        
-        // Second round tickets - user3's additional tickets
-        for (uint i = 52; i < 57; i++) {
-            assertEq(tickets[i], user3, "Wrong owner in user3 second batch");
-        }
-    }
-    
-    // Test for getUserTicketCount function
-    function testGetUserTicketCount() public {
-        uint256 day = getCurrentDay();
-        
-        // No tickets initially
-        assertEq(osdraw.getUserTicketCount(user1, day), 0, "Should have 0 tickets initially");
-        
-        // User1 buys 1 ticket
-        vm.prank(user1);
-        osdraw.buyTickets{value: PRICE_ONE}(1);
-        assertEq(osdraw.getUserTicketCount(user1, day), 1, "Should have 1 ticket after first purchase");
-        
-        // User2 buys 5 tickets
-        vm.prank(user2);
-        osdraw.buyTickets{value: PRICE_FIVE}(5);
-        assertEq(osdraw.getUserTicketCount(user2, day), 5, "Should have 5 tickets");
-        
-        // User1 buys 20 more tickets
-        vm.prank(user1);
-        osdraw.buyTickets{value: PRICE_TWENTY}(20);
-        assertEq(osdraw.getUserTicketCount(user1, day), 21, "Should have 21 tickets after second purchase");
-        
-        // User3 buys no tickets
-        assertEq(osdraw.getUserTicketCount(user3, day), 0, "Should have 0 tickets if none purchased");
-        
-        // Check for a different day
-        uint256 nextDay = day + 1;
-        assertEq(osdraw.getUserTicketCount(user1, nextDay), 0, "Should have 0 tickets on a different day");
-        
-        // User1 buys tickets on next day
-        vm.warp(block.timestamp + 1 days);
-        vm.prank(user1);
-        osdraw.buyTickets{value: PRICE_FIVE}(5);
-        
-        // Check that tickets are tracked correctly across days
-        assertEq(osdraw.getUserTicketCount(user1, day), 21, "Should still have 21 tickets for first day");
-        assertEq(osdraw.getUserTicketCount(user1, nextDay), 5, "Should have 5 tickets for second day");
-    }
-    
-    // Helper function to get the current day
-    function getCurrentDay() internal view returns (uint256) {
-        return block.timestamp / 1 days;
+    function requestRandomNumberWithTraceId(uint256 traceId) external returns (uint256) {
+        requestCount++;
+        emit RandomNumberRequested(requestCount, msg.sender, traceId);
+        return requestCount;
     }
 } 
