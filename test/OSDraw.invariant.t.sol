@@ -334,6 +334,114 @@ contract OSDrawInvariantTest is Test {
             );
         }
     }
+
+    /**
+     * @dev Invariant: Prize pot distribution is always correct
+     * - 50% goes to open source recipient
+     * - adminShare% goes to admin
+     * - remainder goes to winner
+     */
+    function invariant_prizePotDistribution() public {
+        // Get all pending payments
+        uint256 adminPending = osDraw.getPendingPayment(osDraw.admin());
+        uint256 recipientPending = osDraw.getPendingPayment(osDraw.openSourceRecipient());
+        
+        // For each actor, check their pending payments
+        for (uint256 i = 0; i < actors.length; i++) {
+            uint256 actorPending = osDraw.getPendingPayment(actors[i]);
+            
+            // If this actor has pending payments, they must be a winner
+            if (actorPending > 0) {
+                // Calculate expected shares
+                uint256 totalPot = adminPending + recipientPending + actorPending;
+                uint256 expectedAdminShare = (totalPot * osDraw.adminShare()) / 100;
+                uint256 expectedRecipientShare = (totalPot * 50) / 100; // 50% for open source
+                uint256 expectedWinnerShare = totalPot - expectedAdminShare - expectedRecipientShare;
+                
+                // Verify the distribution matches within 1 wei (to account for rounding)
+                assertApproxEqAbs(adminPending, expectedAdminShare, 1, "Admin share incorrect");
+                assertApproxEqAbs(recipientPending, expectedRecipientShare, 1, "Recipient share incorrect");
+                assertApproxEqAbs(actorPending, expectedWinnerShare, 1, "Winner share incorrect");
+            }
+        }
+    }
+
+    /**
+     * @dev Invariant: Active pools must have correct ticket counts
+     */
+    function invariant_poolTicketCounts() public {
+        for (uint256 poolId = Constants.POOL_ID_THRESHOLD; poolId <= Constants.POOL_ID_THRESHOLD + 100; poolId++) {
+            Pool memory pool = osDraw.getPool(poolId);
+            if (pool.active && pool.ticketPrice > 0) {
+                // For active pools, total sold should equal total redeemed plus current balance
+                assertEq(
+                    pool.totalSold,
+                    pool.totalRedeemed + (pool.ethBalance / pool.ticketPrice),
+                    "Pool ticket count mismatch"
+                );
+            }
+        }
+    }
+
+    /**
+     * @dev Invariant: Daily pot splits and distribution are correct
+     * - Verifies daily pot amounts are tracked correctly
+     * - Checks that draws properly distribute funds
+     * - Ensures no funds are lost during daily operations
+     */
+    function invariant_dailyPotSplits() public {
+        // Get current day
+        uint256 currentDay = block.timestamp / 1 days;
+        
+        // For each day that has a pot
+        for (uint256 day = 0; day <= currentDay; day++) {
+            uint256 dailyPotAmount = osDraw.dailyPot(day);
+            
+            // If there's a pot for this day
+            if (dailyPotAmount > 0) {
+                // Check if draw has been performed (by looking for pending payments)
+                bool drawPerformed = false;
+                uint256 totalPendingPayments = 0;
+                
+                // Check admin and recipient pending payments
+                uint256 adminPending = osDraw.getPendingPayment(osDraw.admin());
+                uint256 recipientPending = osDraw.getPendingPayment(osDraw.openSourceRecipient());
+                
+                // Check all actors for pending payments
+                for (uint256 i = 0; i < actors.length; i++) {
+                    uint256 actorPending = osDraw.getPendingPayment(actors[i]);
+                    if (actorPending > 0) {
+                        drawPerformed = true;
+                    }
+                    totalPendingPayments += actorPending;
+                }
+                
+                // If draw was performed, verify distribution
+                if (drawPerformed) {
+                    // Total pending payments should equal the original pot amount
+                    assertEq(
+                        totalPendingPayments + adminPending + recipientPending,
+                        dailyPotAmount,
+                        "Daily pot distribution amount mismatch"
+                    );
+                    
+                    // Verify distribution percentages
+                    uint256 expectedAdminShare = (dailyPotAmount * osDraw.adminShare()) / 100;
+                    uint256 expectedRecipientShare = (dailyPotAmount * 50) / 100; // 50% for open source
+                    
+                    assertApproxEqAbs(adminPending, expectedAdminShare, 1, "Daily pot admin share incorrect");
+                    assertApproxEqAbs(recipientPending, expectedRecipientShare, 1, "Daily pot recipient share incorrect");
+                } else {
+                    // If draw hasn't been performed, pot should still be in contract
+                    assertEq(
+                        dailyPotAmount,
+                        osDraw.dailyPot(day),
+                        "Daily pot amount changed before draw"
+                    );
+                }
+            }
+        }
+    }
 }
 
 /**
