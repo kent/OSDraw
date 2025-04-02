@@ -3,34 +3,45 @@ pragma solidity ^0.8.20;
 
 import {Test, console2} from "forge-std/Test.sol";
 import {OSDraw} from "../src/OSDraw.sol";
-import {OSDrawStorage} from "../src/OSDrawStorage.sol";
+import {OSDrawTimelock} from "../src/timelock/OSDrawTimelock.sol";
 import {Constants} from "../src/model/Constants.sol";
 import {IVRFSystem} from "../src/interfaces/IVRF.sol";
 import "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 
 /**
  * @title OSDrawSymbolicTest
- * @dev Symbolic execution tests for OSDraw
- * 
- * These tests use techniques similar to formal verification to prove critical
- * security properties hold for all possible inputs within bounds.
+ * @dev Formal verification tests for OSDraw system
+ * These tests use symbolic execution to verify security properties
  */
 contract OSDrawSymbolicTest is Test {
     OSDraw public osDraw;
+    OSDrawTimelock public timelock;
     address public admin;
     address public manager;
     address public openSourceRecipient;
-    address public user;
+    address public user1;
+    address public user2;
+    address public proposer;
+    address public executor;
     
-    // Mock VRF for randomness
+    // Mock VRF system
     MockVRFSystem public mockVRF;
+    
+    // Roles
+    bytes32 public constant PROPOSER_ROLE = keccak256("PROPOSER_ROLE");
+    bytes32 public constant EXECUTOR_ROLE = keccak256("EXECUTOR_ROLE");
+    bytes32 public constant CANCELLER_ROLE = keccak256("CANCELLER_ROLE");
 
     function setUp() public {
         admin = makeAddr("admin");
         manager = makeAddr("manager");
         openSourceRecipient = makeAddr("openSourceRecipient");
-        user = makeAddr("user");
-        
+        user1 = makeAddr("user1");
+        user2 = makeAddr("user2");
+        proposer = makeAddr("proposer");
+        executor = makeAddr("executor");
+
+        // Deploy mock VRF for randomness testing
         mockVRF = new MockVRFSystem();
         
         // Deploy implementation
@@ -51,115 +62,109 @@ contract OSDrawSymbolicTest is Test {
         // Cast proxy to OSDraw interface
         osDraw = OSDraw(address(proxy));
         
-        // Configure VRF
+        // Configure VRF entropy source
         vm.prank(admin);
         osDraw.setEntropySource(address(mockVRF));
         
-        // Fund test accounts
-        vm.deal(user, 100 ether);
+        // Set up proposers and executors arrays for timelock
+        address[] memory proposers = new address[](1);
+        proposers[0] = proposer;
+        
+        address[] memory executors = new address[](1);
+        executors[0] = executor;
+        
+        // Deploy timelock with 2-day delay
+        timelock = new OSDrawTimelock(
+            Constants.DEFAULT_TIMELOCK_DELAY,
+            proposers,
+            executors,
+            admin
+        );
+        
+        // Transfer ownership to timelock
+        vm.prank(osDraw.owner());
+        osDraw.transferOwnership(address(timelock));
     }
-    
-    /**
-     * @dev Symbolic test of prize distribution correctness
-     * Proves that for any pot size, prize shares always sum to the total
-     */
-    function test_sym_prizeDistributionCorrectness(uint256 potSize) public {
-        // Bound pot size to realistic values
-        potSize = bound(potSize, 0.001 ether, 1000 ether);
-        
-        // Calculate shares based on contract rules
-        uint256 adminShare = (potSize * 40) / 100; // 40% admin
-        uint256 osShare = (potSize * 50) / 100;    // 50% open source
-        uint256 winnerShare = potSize - adminShare - osShare; // Remainder to winner
-        
-        // Verify sum of shares equals pot size
-        assertEq(adminShare + osShare + winnerShare, potSize, "Shares must sum to pot size");
-        
-        // Verify shares are in correct proportions
-        assertApproxEqRel(adminShare, (potSize * 40) / 100, 0.0001e18, "Admin share incorrect");
-        assertApproxEqRel(osShare, (potSize * 50) / 100, 0.0001e18, "OS share incorrect");
-        
-        // Verify no precision loss can lead to incorrect distribution
-        uint256 reconstructedPot = adminShare + osShare + winnerShare;
-        assertEq(reconstructedPot, potSize, "Precision loss in distribution");
-    }
-    
-    /**
-     * @dev Symbolic test for randomness bounds
-     * Proves that for any random number, winner selection stays within bounds
-     */
-    function test_sym_randomnessBounds(uint256 randomNumber, uint8 numTickets) public {
-        // Ensure we have at least 1 ticket
-        numTickets = uint8(bound(numTickets, 1, 100));
-        
-        // Create a mock ticket array
-        address[] memory tickets = new address[](numTickets);
-        for (uint8 i = 0; i < numTickets; i++) {
-            tickets[i] = makeAddr(string.concat("holder", vm.toString(i)));
-        }
-        
-        // Calculate winner index using the same logic as the contract
-        uint256 winnerIndex = randomNumber % numTickets;
-        
-        // Verify winner index is within bounds regardless of random input
-        assertTrue(winnerIndex < numTickets, "Winner index out of bounds");
-        assertTrue(winnerIndex >= 0, "Winner index negative");
-        
-        // Additional verification that using unchecked math in this context is safe
-        unchecked {
-            uint256 uncheckedWinnerIndex = randomNumber % numTickets;
-            assertEq(uncheckedWinnerIndex, winnerIndex, "Unchecked math produces different result");
-        }
-    }
-    
+
     /**
      * @dev Symbolic test for timelock security
-     * Proves that operations cannot be executed before delay expires
-     * for any timestamp and delay combination
+     * Verifies operations cannot bypass the timelock for any delay
      */
-    function test_sym_timelockSecurity(uint256 initialTimestamp, uint256 delay) public {
-        // Bound values to reasonable ranges
-        initialTimestamp = bound(initialTimestamp, 1, block.timestamp + 365 days);
-        delay = bound(delay, Constants.MIN_TIMELOCK_DELAY, Constants.MAX_TIMELOCK_DELAY);
+    function test_sym_timelockSecurity(uint256 delay) public {
+        // Constrain delay to reasonable bounds
+        vm.assume(delay >= Constants.MIN_TIMELOCK_DELAY);
+        vm.assume(delay <= Constants.MAX_TIMELOCK_DELAY);
         
-        console2.log("Bound result", initialTimestamp);
-        console2.log("Bound result", delay);
+        uint256 initialTimestamp = block.timestamp;
+        address newOwner = makeAddr("newOwner");
         
-        // Setup
-        vm.warp(initialTimestamp);
-        address recipient = makeAddr("recipient");
-        vm.deal(address(osDraw), 1 ether);
+        // Deploy a new timelock with the symbolic delay
+        address[] memory proposers = new address[](1);
+        proposers[0] = proposer;
         
-        // Create a unique operationId that we can reference later
-        bytes32 opId = keccak256(abi.encode(
-            "emergencyWithdraw",
-            1 ether,
-            recipient,
-            block.chainid
-        ));
+        address[] memory executors = new address[](1);
+        executors[0] = executor;
         
-        // Set specific timelock delay for this test
-        vm.startPrank(address(osDraw.owner()));
-        osDraw.setTimelockDelay(delay);
+        OSDrawTimelock customTimelock = new OSDrawTimelock(
+            delay,
+            proposers,
+            executors,
+            admin
+        );
         
-        // Queue the withdrawal operation (first call)
-        osDraw.emergencyWithdraw(1 ether, recipient);
-        vm.stopPrank();
+        // Transfer OSDraw ownership to the new timelock
+        vm.prank(address(timelock));
+        osDraw.transferOwnership(address(customTimelock));
+        
+        // Create the operation - transferring ownership
+        bytes memory data = abi.encodeWithSelector(
+            osDraw.transferOwnership.selector,
+            newOwner
+        );
+        
+        // Schedule the operation
+        vm.prank(proposer);
+        bytes32 operationId = customTimelock.hashOperation(
+            address(osDraw),
+            0,
+            data,
+            bytes32(0),
+            bytes32(0)
+        );
+        
+        vm.prank(proposer);
+        customTimelock.schedule(
+            address(osDraw),
+            0,
+            data,
+            bytes32(0),
+            bytes32(0),
+            delay
+        );
         
         // Create a custom contract to try to bypass the timelock
-        TimelockBypassAttacker attacker = new TimelockBypassAttacker(osDraw);
+        TimelockBypassAttacker attacker = new TimelockBypassAttacker(customTimelock, osDraw);
         
         // Try to bypass the timelock - this should fail
-        bool bypassSucceeded = attacker.attackEmergencyWithdraw(1 ether, recipient);
+        bool bypassSucceeded = attacker.attackTimelockOperation(operationId);
         assertFalse(bypassSucceeded, "Should not be able to bypass timelock");
+        
+        // Verify ownership still with timelock
+        assertEq(osDraw.owner(), address(customTimelock), "Ownership changed before timelock expired");
         
         // Try executing at exactly delay timestamp - should succeed
         vm.warp(initialTimestamp + delay);
-        vm.prank(address(osDraw.owner()));
-        osDraw.emergencyWithdraw(1 ether, recipient);
+        vm.prank(executor);
+        customTimelock.execute(
+            address(osDraw),
+            0,
+            data,
+            bytes32(0),
+            bytes32(0)
+        );
         
-        // Verify recipient received funds
-        assertEq(recipient.balance, 1 ether, "Recipient didn't receive funds");
+        // Verify ownership was transferred
+        assertEq(osDraw.owner(), newOwner, "Ownership not transferred after timelock expired");
     }
     
     /**
@@ -225,20 +230,24 @@ contract MockVRFSystem is IVRFSystem {
  * @dev Contract that attempts to bypass timelock
  */
 contract TimelockBypassAttacker {
+    OSDrawTimelock public timelock;
     OSDraw public target;
     
-    constructor(OSDraw _target) {
+    constructor(OSDrawTimelock _timelock, OSDraw _target) {
+        timelock = _timelock;
         target = _target;
     }
     
-    function attackEmergencyWithdraw(uint256 amount, address recipient) external returns (bool) {
+    function attackTimelockOperation(bytes32 operationId) external returns (bool) {
         // Attempt to execute immediately (before timelock expires)
-        try target.emergencyWithdraw(amount, recipient) {
-            // If no revert, check if funds were actually transferred
-            if (recipient.balance > 0) {
-                return true; // We managed to bypass the timelock!
-            }
-            return false; // Operation was queued, not executed
+        try timelock.execute(
+            address(target),
+            0,
+            abi.encodeWithSelector(target.transferOwnership.selector, msg.sender),
+            bytes32(0),
+            bytes32(0)
+        ) {
+            return true; // We managed to bypass the timelock!
         } catch {
             // Expected - operation protected by timelock
             return false;

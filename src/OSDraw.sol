@@ -99,41 +99,16 @@ contract OSDraw is
 
     /**
      * @dev Authorization function for contract upgrades
+     * This uses a simple auth check instead of the timelock mechanism
+     * since timelock functionality is now handled by the TimelockController contract
      * @param newImpl Address of the new implementation
      */
     function _authorizeUpgrade(address newImpl) internal override onlyOwner {
-        // Create a unique operation ID for this upgrade
-        bytes32 operationId = keccak256(abi.encode(
-            "upgrade",
-            newImpl,
-            block.chainid
-        ));
-        
-        // Get storage 
-        Storage storage s = _getStorage();
-        
-        // Check if operation is queued and ready
-        uint256 queuedTime = s.timelockOperations[operationId];
-        if (queuedTime == 0) {
-            // Queue the upgrade with default 2-day timelock if not set
-            uint256 delay = s.timelockDelay > 0 ? s.timelockDelay : 2 days;
-            uint256 executeTime = block.timestamp + delay;
-            s.timelockOperations[operationId] = executeTime;
-            
-            emit OperationQueued(operationId, executeTime);
-            revert("Upgrade queued, please try again after timelock expires");
-        }
-        
-        // Ensure timelock has expired
-        if (block.timestamp < queuedTime) {
-            revert("Timelock not expired yet");
-        }
-        
-        // Clear the timelock
-        delete s.timelockOperations[operationId];
-        
-        // Emit upgrade event
-        emit OperationExecuted(operationId);
+        // Simple authorization check - only owner can upgrade
+        // No need for timelock logic as that's now handled by the TimelockController
+
+        // Emit upgrade event for logging
+        emit OperationExecuted(keccak256(abi.encode("upgrade", newImpl, block.chainid)));
     }
     
     // --- Public getters (required for backwards compatibility) ---

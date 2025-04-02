@@ -60,71 +60,9 @@ contract OSDrawConfig is OSDrawStorage {
     }
     
     /**
-     * @dev Set the timelock delay (time required between queuing and execution)
-     * @param newDelay The new delay in seconds
-     */
-    function setTimelockDelay(uint256 newDelay) external {
-        Storage storage s = _getStorage();
-        if (msg.sender != s.config.owner) revert Unauthorized();
-        
-        if (newDelay < Constants.MIN_TIMELOCK_DELAY || newDelay > Constants.MAX_TIMELOCK_DELAY) {
-            revert InvalidAmount();
-        }
-        
-        s.timelockDelay = newDelay;
-        
-        emit TimelockDelayUpdated(newDelay);
-    }
-
-    /**
-     * @dev Queue a timelock operation
-     * @param operationId Unique identifier for the operation
-     * @return The timestamp when the operation will be executable
-     */
-    function queueTimelockOperation(bytes32 operationId) internal returns (uint256) {
-        Storage storage s = _getStorage();
-        
-        if (s.timelockDelay == 0) {
-            // If timelock not initialized, set a default
-            s.timelockDelay = Constants.DEFAULT_TIMELOCK_DELAY;
-        }
-        
-        uint256 executeTime = block.timestamp + s.timelockDelay;
-        s.timelockOperations[operationId] = executeTime;
-        
-        emit OperationQueued(operationId, executeTime);
-        return executeTime;
-    }
-
-    /**
-     * @dev Checks if a timelock operation is ready to execute
-     * @param operationId Unique identifier for the operation
-     * @return If the operation is executable
-     */
-    function isOperationReady(bytes32 operationId) internal view returns (bool) {
-        Storage storage s = _getStorage();
-        uint256 queuedTime = s.timelockOperations[operationId];
-        
-        return queuedTime > 0 && block.timestamp >= queuedTime;
-    }
-
-    /**
-     * @dev Consumes a timelock operation, marking it as executed
-     * @param operationId Unique identifier for the operation
-     */
-    function executeOperation(bytes32 operationId) internal {
-        Storage storage s = _getStorage();
-        if (s.timelockOperations[operationId] == 0) revert OperationNotQueued();
-        if (block.timestamp < s.timelockOperations[operationId]) revert OperationNotReady();
-        
-        // Remove operation from queue after execution
-        delete s.timelockOperations[operationId];
-        
-        emit OperationExecuted(operationId);
-    }
-
-    /**
-     * @dev Emergency withdraw with timelock protection
+     * @dev Emergency withdraw function
+     * Note: Timelock protection is now handled by the separate TimelockController contract
+     * 
      * @param amount The amount of ETH to withdraw
      * @param recipient The address to send funds to
      */
@@ -134,25 +72,6 @@ contract OSDrawConfig is OSDrawStorage {
         
         if (recipient == address(0)) revert InvalidAddress();
         if (amount == 0 || amount > address(this).balance) revert InvalidAmount();
-        
-        // Create a unique operation ID based on the parameters
-        bytes32 operationId = keccak256(abi.encode(
-            "emergencyWithdraw",
-            amount,
-            recipient,
-            block.chainid
-        ));
-        
-        // Check if operation is already queued and ready
-        if (!isOperationReady(operationId)) {
-            // Queue the operation if not ready
-            queueTimelockOperation(operationId);
-            emit EmergencyWithdrawalQueued(msg.sender, recipient, amount);
-            return;
-        }
-        
-        // Execute operation
-        executeOperation(operationId);
         
         // Emit event for transparency
         emit EmergencyWithdrawal(msg.sender, recipient, amount);

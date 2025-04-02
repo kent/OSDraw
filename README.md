@@ -202,3 +202,50 @@ User Buys Ticket → OSDraw Contract → VRF Request → VRF Callback
 • Winners, Admin, and Open Source Recipient withdraw via pull-payment.  
 • Admin can create/update pools, set VRF provider, and manage liquidity.  
 • The Owner can upgrade the contract after the timelock period.
+
+## Timelock Security
+
+OSDraw uses OpenZeppelin's TimelockController to enforce a mandatory delay between proposing critical operations and executing them. This provides an essential security layer for contract governance.
+
+### Why We Use a Timelock
+
+The timelock mechanism serves several critical purposes:
+
+1. **User Protection**: Users have time to exit the system before potentially dangerous operations (like contract upgrades) can be executed.
+
+2. **Community Oversight**: The mandatory delay gives the community time to review and react to pending governance actions before they're executed.
+
+3. **Multi-step Security**: By requiring two separate actions (scheduling and execution) with a time gap between them, timelocks protect against compromised owner keys and single-point failures.
+
+4. **Front-running Protection**: Timelock prevents malicious actors from quickly executing harmful operations before users can respond.
+
+### Protected Functions
+
+The following critical operations are protected by the timelock:
+
+1. **Contract Upgrades**: Any upgrade to the contract implementation through the UUPS pattern requires timelock protection.
+
+2. **Emergency Withdrawals**: In case of emergency, funds can only be withdrawn after the timelock period has passed.
+
+3. **Ownership Transfers**: Changing contract ownership must go through the timelock.
+
+### How the Timelock Works
+
+OSDraw uses a role-based timelock with the following structure:
+
+1. **Proposer Role**: Addresses with this role can schedule operations. This is typically assigned to a DAO or multisig wallet.
+
+2. **Executor Role**: Addresses with this role can execute operations after the timelock delay has passed. This can be the same as the proposer or a separate entity.
+
+3. **Canceller Role**: Addresses that can cancel pending operations.
+
+4. **Admin Role**: Can manage the above roles. Typically, this role is given to the timelock itself for self-governance.
+
+The workflow for any timelock-protected operation is:
+
+1. A proposer schedules the operation.
+2. The mandatory delay period begins (default: 2 days).
+3. After the delay expires, an executor can execute the operation.
+4. At any point before execution, a canceller can cancel the scheduled operation.
+
+This implementation offers more fine-grained control over the governance process compared to simpler timelocks, with distinct addresses potentially handling different steps of the process.

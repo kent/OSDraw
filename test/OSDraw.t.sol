@@ -8,6 +8,7 @@ import {Constants} from "../src/model/Constants.sol";
 import {IVRFSystem} from "../src/interfaces/IVRF.sol";
 import {Pool} from "../src/model/Pool.sol";
 import {Ticket} from "../src/model/Ticket.sol";
+import {OSDrawTimelock} from "../src/timelock/OSDrawTimelock.sol";
 import "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 
 /**
@@ -485,35 +486,82 @@ contract OSDrawTest is Test {
      * Verifies: Timelock protection works for critical operations
      */
     function test_timelockOperations() public {
-        // Setup
-        address recipient = makeAddr("emergencyRecipient");
-        uint256 withdrawAmount = 1 ether;
+        // This test has been modified for the new OpenZeppelin TimelockController implementation
+        // Deploy timelock for this test
+        address[] memory proposers = new address[](1);
+        proposers[0] = admin;
         
-        // Send some ETH to the contract for emergency withdrawal
-        vm.deal(address(osDraw), withdrawAmount);
+        address[] memory executors = new address[](1);
+        executors[0] = admin;
         
-        // Try emergency withdrawal - should revert with a specific error
-        // We don't need to check for a specific error since the first call to emergencyWithdraw
-        // actually queues the operation rather than reverting
-        vm.prank(address(osDraw.owner()));
-        osDraw.emergencyWithdraw(withdrawAmount, recipient);
+        OSDrawTimelock timelock = new OSDrawTimelock(
+            Constants.DEFAULT_TIMELOCK_DELAY,
+            proposers,
+            executors,
+            admin
+        );
         
-        // Try executing too early - should revert because timelock not expired
-        // Let's try to execute again immediately - this should queue again, not revert
-        vm.prank(address(osDraw.owner()));
-        osDraw.emergencyWithdraw(withdrawAmount, recipient);
+        // Transfer ownership to timelock
+        vm.prank(osDraw.owner());
+        osDraw.transferOwnership(address(timelock));
+        
+        // Setup - create an emergency withdrawal function that's callable by the owner
+        // We need to create a new function for testing since emergencyWithdraw requires manager role
+        // Let's use transferOwnership which requires owner role and can be called by the timelock
+        address newOwner = makeAddr("newOwner");
+        
+        // Prepare operation data
+        bytes memory data = abi.encodeWithSelector(
+            osDraw.transferOwnership.selector,
+            newOwner
+        );
+        
+        // Schedule the operation (as admin who is proposer)
+        vm.prank(admin);
+        bytes32 operationId = timelock.hashOperation(
+            address(osDraw),
+            0,
+            data,
+            bytes32(0),
+            bytes32(0)
+        );
+        
+        vm.prank(admin);
+        timelock.schedule(
+            address(osDraw),
+            0,
+            data,
+            bytes32(0),
+            bytes32(0),
+            Constants.DEFAULT_TIMELOCK_DELAY
+        );
+        
+        // Try executing too early - should revert
+        vm.prank(admin);
+        vm.expectRevert(); // Expect revert because operation is not ready
+        timelock.execute(
+            address(osDraw),
+            0,
+            data,
+            bytes32(0),
+            bytes32(0)
+        );
         
         // Fast forward past timelock period
         vm.warp(block.timestamp + Constants.DEFAULT_TIMELOCK_DELAY + 1);
         
-        // Execute withdrawal now
-        uint256 recipientBalanceBefore = recipient.balance;
-        vm.prank(address(osDraw.owner()));
-        osDraw.emergencyWithdraw(withdrawAmount, recipient);
+        // Execute operation now
+        vm.prank(admin);
+        timelock.execute(
+            address(osDraw),
+            0,
+            data,
+            bytes32(0),
+            bytes32(0)
+        );
         
-        // Verify withdrawal
-        assertEq(recipient.balance, recipientBalanceBefore + withdrawAmount, "Emergency withdrawal not completed");
-        assertEq(address(osDraw).balance, 0, "Contract should have 0 balance after withdrawal");
+        // Verify ownership was transferred
+        assertEq(osDraw.owner(), newOwner, "Ownership was not transferred properly");
     }
     
     /**
@@ -521,39 +569,92 @@ contract OSDrawTest is Test {
      * Verifies: Contract upgrades are protected by timelock
      */
     function test_upgradeTimelock() public {
+        // This test has been modified for the new OpenZeppelin TimelockController implementation
+        // Deploy timelock for this test
+        address[] memory proposers = new address[](1);
+        proposers[0] = admin;
+        
+        address[] memory executors = new address[](1);
+        executors[0] = admin;
+        
+        OSDrawTimelock timelock = new OSDrawTimelock(
+            Constants.DEFAULT_TIMELOCK_DELAY,
+            proposers,
+            executors,
+            admin
+        );
+        
+        // Transfer ownership to timelock
+        vm.prank(osDraw.owner());
+        osDraw.transferOwnership(address(timelock));
+        
         // Deploy a new implementation
         OSDraw newImplementation = new OSDraw();
         
-        // First call to upgradeToAndCall should queue the operation
-        vm.prank(address(osDraw.owner()));
-        try osDraw.upgradeToAndCall(address(newImplementation), "") {
-            assertTrue(false, "Upgrade should be queued and revert first time");
-        } catch Error(string memory reason) {
-            assertEq(reason, "Upgrade queued, please try again after timelock expires");
-        }
-        
-        // Fast forward past timelock period
-        vm.warp(block.timestamp + Constants.DEFAULT_TIMELOCK_DELAY + 1);
-        
-        // Directly accessing implementation storage slot to verify upgrade
-        // This is a workaround because there's an issue in the upgrade timelock mechanism
-        // The real implementation would need a fix to reset the operationId correctly
-        
-        // For testing purposes, we'll assume the upgrade was successful
-        // in a real scenario, we would need to fix the contract's logic
-        
-        // Mock a successful upgrade by manipulating the proxy state
-        // This is only for testing, not a real solution
-        vm.store(
-            address(osDraw),
-            bytes32(uint256(keccak256("eip1967.proxy.implementation")) - 1),
-            bytes32(uint256(uint160(address(newImplementation))))
+        // Prepare upgrade data
+        bytes memory data = abi.encodeWithSelector(
+            osDraw.upgradeToAndCall.selector,
+            address(newImplementation),
+            ""
         );
         
-        // Verify the implementation was "upgraded" by reading the implementation slot
+        // Get original implementation address for comparison
+        bytes32 implSlotBefore = bytes32(uint256(keccak256("eip1967.proxy.implementation")) - 1);
+        bytes32 implAddressBefore = vm.load(address(osDraw), implSlotBefore);
+        address originalImpl = address(uint160(uint256(implAddressBefore)));
+        
+        // Using TimelockController security
+        // 1. Try executing operation directly without scheduling - should fail
+        vm.prank(admin);
+        vm.expectRevert(); // Will revert since operation not scheduled
+        timelock.execute(
+            address(osDraw),
+            0,
+            data,
+            bytes32(0),
+            bytes32(0)
+        );
+        
+        // 2. Schedule the upgrade through timelock
+        vm.prank(admin);
+        timelock.schedule(
+            address(osDraw),
+            0,
+            data,
+            bytes32(0),
+            bytes32(0),
+            Constants.DEFAULT_TIMELOCK_DELAY
+        );
+        
+        // 3. Try executing too early - should fail
+        vm.prank(admin);
+        vm.expectRevert(); // Will revert since delay not passed
+        timelock.execute(
+            address(osDraw),
+            0,
+            data,
+            bytes32(0),
+            bytes32(0)
+        );
+        
+        // 4. Fast forward past timelock period
+        vm.warp(block.timestamp + Constants.DEFAULT_TIMELOCK_DELAY + 1);
+        
+        // 5. Execute the upgrade
+        vm.prank(admin);
+        timelock.execute(
+            address(osDraw),
+            0,
+            data,
+            bytes32(0),
+            bytes32(0)
+        );
+        
+        // 6. Verify the implementation was upgraded
         bytes32 implSlot = bytes32(uint256(keccak256("eip1967.proxy.implementation")) - 1);
         bytes32 implAddress = vm.load(address(osDraw), implSlot);
         assertEq(address(uint160(uint256(implAddress))), address(newImplementation), "Implementation not updated");
+        assertTrue(address(uint160(uint256(implAddress))) != originalImpl, "Implementation should have changed");
     }
 
     /**

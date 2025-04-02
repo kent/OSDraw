@@ -8,6 +8,7 @@ import {Constants} from "../src/model/Constants.sol";
 import {IVRFSystem} from "../src/interfaces/IVRF.sol";
 import {Pool} from "../src/model/Pool.sol";
 import {Ticket} from "../src/model/Ticket.sol";
+import {InvalidTicketQuantity} from "../src/errors/OSDraw.sol";
 import "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 
 /**
@@ -215,15 +216,18 @@ contract OSDrawAttackTest is Test {
         vm.stopPrank();
         
         // Try to cause an overflow by buying a huge number of tickets
+        // This should fail on quantity check before payment check
         vm.prank(attacker);
-        uint256 hugeQuantity = type(uint256).max;
-        vm.expectRevert(); // Should revert with InvalidTicketQuantity
-        osDraw.buyPoolTickets{value: hugeQuantity}(Constants.POOL_ID_THRESHOLD, hugeQuantity);
+        vm.expectRevert(InvalidTicketQuantity.selector);
+        osDraw.buyPoolTickets(Constants.POOL_ID_THRESHOLD, 1001); // More than 1000 tickets
         
-        // Try with a more realistic but still large quantity
+        // Try with a large quantity and matching value
+        // Make sure attacker has a reasonable amount of ETH to test the quantity validation
+        uint256 largeQuantity = 1001;
+        vm.deal(attacker, largeQuantity);
         vm.prank(attacker);
-        vm.expectRevert(); // Should revert with InvalidTicketQuantity or IncorrectPaymentAmount
-        osDraw.buyPoolTickets{value: 1001}(Constants.POOL_ID_THRESHOLD, 1001);
+        vm.expectRevert(InvalidTicketQuantity.selector);
+        osDraw.buyPoolTickets{value: largeQuantity}(Constants.POOL_ID_THRESHOLD, largeQuantity);
     }
 
     function attackPoolSystem() external returns (bool) {
